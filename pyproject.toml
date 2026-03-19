@@ -1,0 +1,26 @@
+[project]
+name = "sharedinput"
+version = "0.1.0"
+description = "Cross-platform software KVM switch — share mouse and keyboard across devices on your local network"
+requires-python = ">=3.12"
+dependencies = [
+    "pynput>=1.7.6",
+    "cryptography>=42.0",
+    "zeroconf>=0.131",
+    "pystray>=0.19",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+macos = ["pyobjc-framework-Quartz>=10.0"]
+dev = ["pytest>=8.0", "pyinstaller>=6.0"]
+
+[project.scripts]
+sharedinput = "sharedinput.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["sharedinput*"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

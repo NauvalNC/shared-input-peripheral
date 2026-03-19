@@ -1,0 +1,26 @@
+[general]
+# Role: "server" (device with peripherals) or "client" (remote device)
+role = "server"
+
+# Server IP — only needed for client mode
+# server_host = "192.168.1.10"
+
+# Start SharedInput when you log in
+start_on_login = false
+
+[hotkeys]
+next_device = "ctrl+alt+right"
+prev_device = "ctrl+alt+left"
+back_to_local = "ctrl+alt+home"
+
+[network]
+# Port for input events (UDP) and control plane (TCP)
+udp_port = 9876
+tcp_port = 9877
+
+# Encrypt input events over the network
+encryption = true
+
+[devices]
+# Device switching order (use hostnames as they appear when connected)
+# order = ["Mac-Mini", "Laptop"]
