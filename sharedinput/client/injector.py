@@ -87,8 +87,6 @@ class InputInjector:
             point = Quartz.CGPointMake(self._mac_mouse_x, self._mac_mouse_y)
             # Warp cursor directly (no event re-processing)
             Quartz.CGWarpMouseCursorPosition(point)
-            # Re-associate so the next warp works (macOS disassociates after warp)
-            Quartz.CGAssociateMouseAndMouseCursorPosition(True)
         else:
             self._mouse.move(event.dx, event.dy)
 

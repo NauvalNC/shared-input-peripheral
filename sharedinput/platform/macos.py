@@ -311,13 +311,21 @@ if _HAS_QUARTZ:
         def set_suppressing(self, suppressing: bool) -> None:
             """Toggle input suppression. When True, local input is blocked."""
             self._suppressing = suppressing
-            # Disconnect hardware mouse from cursor and hide cursor
-            Quartz.CGAssociateMouseAndMouseCursorPosition(not suppressing)
+            # Disconnect hardware mouse from cursor so it stops moving
+            result = Quartz.CGAssociateMouseAndMouseCursorPosition(not suppressing)
+            logger.info(
+                "Input suppression: %s (CGAssociate=%s, result=%s)",
+                "ON" if suppressing else "OFF",
+                "dissociate" if suppressing else "associate",
+                result,
+            )
             if suppressing:
-                Quartz.CGDisplayHideCursor(Quartz.CGMainDisplayID())
+                # Hide cursor — call multiple times to ensure it takes effect
+                for _ in range(5):
+                    Quartz.CGDisplayHideCursor(Quartz.CGMainDisplayID())
             else:
-                Quartz.CGDisplayShowCursor(Quartz.CGMainDisplayID())
-            logger.info("Input suppression: %s", "ON" if suppressing else "OFF")
+                for _ in range(5):
+                    Quartz.CGDisplayShowCursor(Quartz.CGMainDisplayID())
 
         def _tap_callback(self, proxy, event_type, cg_event, refcon):
             """CGEventTap callback — runs on the main thread."""
