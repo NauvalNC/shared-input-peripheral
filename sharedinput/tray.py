@@ -1,29 +1,28 @@
 """System tray UI — runs SharedInput as a menu bar / system tray app.
 
-Menu structure:
-- Idle: Start as Server, Searching for server..., Quit
-- Server: status, Switch Input > (devices with checkmarks), Disconnect, Quit
-- Client: status, Switch Input > (devices), Disconnect, Quit
+All devices broadcast AVAILABLE on launch. One device clicks
+"Start as Server" — it discovers other devices and auto-connects
+to them. Clients are passive (no manual action needed).
 
-Auto-connect: when idle and a server is discovered via UDP broadcast,
-the app automatically connects as a client — no manual action needed.
+Menu:
+- Idle: broadcasting presence, "Start as Server", Quit
+- Server: Switch Input > (devices), Disconnect, Quit
+- Client: "Controlled by [server]", Disconnect, Quit
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import platform
 import socket
 import sys
 import threading
-from typing import Callable
 
 import pystray
 from PIL import Image
 
 from sharedinput.config import Config, load_config
-from sharedinput.discovery import DiscoveryListener, ServerInfo
+from sharedinput.discovery import DeviceBroadcaster
 from sharedinput.icons import create_active_icon, create_default_icon, create_disabled_icon
 
 logger = logging.getLogger(__name__)
@@ -52,15 +51,16 @@ class TrayApp:
         self._client = None
         self._server_thread: threading.Thread | None = None
         self._client_thread: threading.Thread | None = None
-        self._running_role: str | None = None  # "server" | "client" | None
+        self._running_role: str | None = None
 
-        # Discovery with auto-connect callback
-        self._discovery = DiscoveryListener(
+        # ALL devices broadcast their presence
+        self._broadcaster = DeviceBroadcaster(
+            tcp_port=self._config.network.tcp_port,
             discovery_port=self._config.network.discovery_port,
-            on_server_found=self._on_server_discovered,
         )
+
         # Snapshots for menu
-        self._connected_clients: list[tuple[str, str]] = []  # (client_id, hostname)
+        self._connected_clients: list[tuple[str, str]] = []
 
         # Icons
         self._icon_default = create_default_icon(64)
@@ -72,13 +72,17 @@ class TrayApp:
 
     def run(self) -> None:
         """Start the tray app (blocking)."""
-        # Start discovery — auto-connects when server found
-        self._discovery.start()
+        # Start broadcasting — all devices do this
+        self._broadcaster.start()
+
+        # Also start as passive client (TCP server waiting for connections)
+        self._start_passive_client()
+
         self._start_refresh_timer()
 
         self._icon = pystray.Icon(
             name="SharedInput",
-            icon=self._icon_disabled,
+            icon=self._icon_default,
             title="SharedInput",
             menu=self._build_menu(),
         )
@@ -88,20 +92,9 @@ class TrayApp:
     def _on_setup(self, icon: pystray.Icon) -> None:
         icon.visible = True
         icon.notify(
-            "SharedInput is running.\nSearching for server...",
+            "SharedInput is ready.\nThis device is visible on the network.",
             "SharedInput",
         )
-
-    # ── Auto-connect ─────────────────────────────────────────────────────
-
-    def _on_server_discovered(self, server: ServerInfo) -> None:
-        """Called by DiscoveryListener when a server is found. Auto-connect."""
-        if self._running_role is not None:
-            return  # already connected or serving
-        logger.info("Server discovered: %s (%s) — auto-connecting", server.hostname, server.ip)
-        self._config.server_host = server.ip
-        self._config.network.tcp_port = server.tcp_port
-        self._start_client()
 
     # ── Menu building ────────────────────────────────────────────────────
 
@@ -109,12 +102,10 @@ class TrayApp:
         items: list[pystray.MenuItem] = []
         items.append(pystray.MenuItem("SharedInput", None, enabled=False))
 
-        if self._running_role is None:
+        if self._running_role is None or self._running_role == "passive_client":
             items.extend(self._build_idle_menu())
         elif self._running_role == "server":
             items.extend(self._build_server_menu())
-        elif self._running_role == "client":
-            items.extend(self._build_client_menu())
 
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("Quit", self._on_quit))
@@ -122,9 +113,21 @@ class TrayApp:
 
     def _build_idle_menu(self) -> list:
         items = []
+        ip = _get_local_ip()
+
+        # Show connection status
+        if self._client and self._client._control.is_connected:
+            server_name = self._client._control.server_hostname or "server"
+            items.append(pystray.MenuItem(
+                f"Controlled by {server_name}", None, enabled=False
+            ))
+        else:
+            items.append(pystray.MenuItem(
+                f"Ready on {ip}", None, enabled=False
+            ))
+
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("Start as Server", self._on_start_server))
-        items.append(pystray.MenuItem("Searching for server...", None, enabled=False))
         return items
 
     def _make_client_item(self, idx: int) -> pystray.MenuItem:
@@ -176,27 +179,13 @@ class TrayApp:
         )
         items.append(
             pystray.MenuItem(
-                "No clients connected",
+                "Searching for devices...",
                 None,
                 enabled=False,
                 visible=lambda item: len(self._connected_clients) == 0,
             )
         )
 
-        items.append(pystray.Menu.SEPARATOR)
-        items.append(pystray.MenuItem("Disconnect", self._on_disconnect))
-        return items
-
-    def _build_client_menu(self) -> list:
-        items = []
-        server_name = ""
-        if self._client and hasattr(self._client, '_control') and self._client._control:
-            server_name = self._client._control.server_hostname
-        if not server_name:
-            server_name = self._config.server_host
-        items.append(
-            pystray.MenuItem(f"Connected to {server_name}", None, enabled=False)
-        )
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("Disconnect", self._on_disconnect))
         return items
@@ -228,7 +217,7 @@ class TrayApp:
 
     def _update_snapshots(self) -> None:
         if self._running_role == "server" and self._server:
-            clients = self._server._control_server.clients
+            clients = self._server._connector.clients
             self._connected_clients = [
                 (cid, info.hostname) for cid, info in clients.items()
             ]
@@ -240,7 +229,7 @@ class TrayApp:
     def _on_start_server(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         if self._running_role == "server":
             return
-        self._stop_current()
+        self._stop_passive_client()
         self._start_server()
 
     def _on_switch_to_local(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
@@ -251,9 +240,9 @@ class TrayApp:
             self._server.switch_to_client(client_id)
 
     def _on_disconnect(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
-        self._stop_current()
-        # Restart discovery for auto-connect
-        self._discovery.start()
+        self._stop_server()
+        # Go back to passive client mode
+        self._start_passive_client()
         self._update_snapshots()
         if self._icon:
             self._icon.menu = self._build_menu()
@@ -261,12 +250,43 @@ class TrayApp:
 
     def _on_quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         self._stop_refresh_timer()
-        self._stop_current()
-        self._discovery.stop()
+        self._stop_server()
+        self._stop_passive_client()
+        self._broadcaster.stop()
         if self._icon:
             self._icon.stop()
 
-    # ── Server / Client lifecycle ────────────────────────────────────────
+    # ── Passive client (always running when not server) ──────────────────
+
+    def _start_passive_client(self) -> None:
+        """Start as passive client — TCP server waiting for connections."""
+        from sharedinput.client.main import Client
+
+        self._client = Client(self._config)
+        self._running_role = "passive_client"
+
+        def run():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._client.run())
+            except Exception:
+                logger.exception("Passive client error")
+            finally:
+                loop.close()
+
+        self._client_thread = threading.Thread(target=run, daemon=True)
+        self._client_thread.start()
+        logger.info("Passive client started — waiting for server connections")
+
+    def _stop_passive_client(self) -> None:
+        if self._client:
+            self._client.shutdown()
+            self._client = None
+        if self._running_role == "passive_client":
+            self._running_role = None
+
+    # ── Server lifecycle ─────────────────────────────────────────────────
 
     def _start_server(self) -> None:
         from sharedinput.server.main import Server
@@ -281,11 +301,13 @@ class TrayApp:
                         "then try again.",
                         "SharedInput — Permission Needed",
                     )
+                # Restart passive client
+                self._start_passive_client()
                 return
 
-        self._discovery.stop()
         self._config.role = "server"
         self._server = Server(self._config)
+        self._server.set_broadcaster(self._broadcaster)
         self._running_role = "server"
         self._server.install_capture_on_main_thread()
 
@@ -305,56 +327,25 @@ class TrayApp:
         self._update_snapshots()
         if self._icon:
             self._icon.menu = self._build_menu()
-            self._icon.notify("Server started.\nWaiting for clients...", "SharedInput")
+            self._icon.notify("Server started.\nDiscovering devices...", "SharedInput")
         logger.info("Server started in background")
 
-    def _start_client(self) -> None:
-        from sharedinput.client.main import Client
-
-        self._discovery.stop()
-        self._config.role = "client"
-        self._client = Client(self._config)
-        self._running_role = "client"
-
-        def run():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(self._client.run())
-            except Exception:
-                logger.exception("Client error")
-            finally:
-                loop.close()
-
-        self._client_thread = threading.Thread(target=run, daemon=True)
-        self._client_thread.start()
-        self._update_icon_state()
-        if self._icon:
-            self._icon.menu = self._build_menu()
-            self._icon.notify(
-                f"Auto-connected to {self._config.server_host}",
-                "SharedInput",
-            )
-        logger.info("Client auto-connected to %s", self._config.server_host)
-
-    def _stop_current(self) -> None:
+    def _stop_server(self) -> None:
         if self._server:
             self._server.shutdown()
             self._server = None
-        if self._client:
-            self._client.shutdown()
-            self._client = None
-        self._running_role = None
+        if self._running_role == "server":
+            self._running_role = None
         self._connected_clients = []
         self._update_icon_state()
 
     def _update_icon_state(self) -> None:
         if not self._icon:
             return
-        if self._running_role is None:
-            self._icon.icon = self._icon_disabled
-        elif self._running_role == "server" and self._server and self._server._forwarding:
+        if self._running_role == "server" and self._server and self._server._forwarding:
             self._icon.icon = self._icon_active
+        elif self._running_role == "server":
+            self._icon.icon = self._icon_default
         else:
             self._icon.icon = self._icon_default
 

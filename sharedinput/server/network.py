@@ -1,7 +1,7 @@
-"""Server networking — UDP sender for input events + TCP control server.
+"""Server networking — UDP sender for input events + TCP client connector.
 
-The UDP sender serializes input events and sends them to the active client.
-The TCP control server handles client registration, heartbeats, and switching.
+The server discovers devices on the LAN and initiates TCP connections TO them.
+Each connected device becomes a client that can receive forwarded input.
 """
 
 from __future__ import annotations
@@ -9,8 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import platform
 import socket
-import ssl
 import time
 from dataclasses import dataclass, field
 
@@ -25,12 +25,13 @@ DEFAULT_TCP_PORT = 9877
 @dataclass
 class ClientInfo:
     """Represents a connected client device."""
-    client_id: str
+    client_id: str  # device_id from discovery
     hostname: str
     platform: str
     address: tuple[str, int]  # (ip, udp_port)
     screen_width: int = 1920
     screen_height: int = 1080
+    writer: asyncio.StreamWriter | None = field(default=None, repr=False)
     last_heartbeat: float = field(default_factory=time.monotonic)
 
 
@@ -42,17 +43,14 @@ class UDPSender:
         self._target: tuple[str, int] | None = None
 
     def set_target(self, address: str, port: int) -> None:
-        """Set the target client to send events to."""
         self._target = (address, port)
         logger.info("UDP target set to %s:%d", address, port)
 
     def clear_target(self) -> None:
-        """Clear the target — stop sending events."""
         self._target = None
         logger.info("UDP target cleared (local mode)")
 
     def send(self, event: InputEvent) -> None:
-        """Serialize and send an event to the active client."""
         if self._target is None:
             return
         data = serialize(event)
@@ -65,114 +63,119 @@ class UDPSender:
         self._sock.close()
 
 
-class ControlServer:
-    """TCP control server for client registration and management."""
+class ClientConnector:
+    """Manages outbound TCP connections to client devices.
 
-    def __init__(self, host: str = "0.0.0.0", port: int = DEFAULT_TCP_PORT) -> None:
-        self._host = host
-        self._port = port
+    The server discovers devices via UDP broadcast and connects TO them.
+    Each connected device can receive forwarded input events.
+    """
+
+    def __init__(self) -> None:
         self._clients: dict[str, ClientInfo] = {}
-        self._server: asyncio.Server | None = None
-        self._on_client_connected: asyncio.Event = asyncio.Event()
+        self._connecting: set[str] = set()  # device IDs currently being connected
 
     @property
     def clients(self) -> dict[str, ClientInfo]:
         return self._clients
 
-    async def start(self) -> None:
-        """Start the TCP control server."""
-        self._server = await asyncio.start_server(
-            self._handle_client, self._host, self._port
-        )
-        addrs = [s.getsockname() for s in self._server.sockets]
-        logger.info("Control server listening on %s", addrs)
+    async def connect_to_device(self, device_id: str, ip: str, tcp_port: int) -> bool:
+        """Initiate TCP connection to a discovered device.
 
-    async def stop(self) -> None:
-        """Stop the control server."""
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
+        Sends SERVER_HELLO, receives CLIENT_INFO response.
+        Returns True on success.
+        """
+        if device_id in self._clients or device_id in self._connecting:
+            return False  # already connected or connecting
 
-    async def _handle_client(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
-        """Handle a client TCP connection."""
-        peer = writer.get_extra_info("peername")
-        logger.info("Control connection from %s", peer)
+        self._connecting.add(device_id)
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, tcp_port),
+                timeout=5.0,
+            )
+        except (OSError, asyncio.TimeoutError) as e:
+            logger.debug("Failed to connect to %s:%d: %s", ip, tcp_port, e)
+            self._connecting.discard(device_id)
+            return False
 
         try:
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
-
-                try:
-                    msg = json.loads(line.decode())
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-
-                response = self._process_message(msg, peer)
-                if response:
-                    writer.write(json.dumps(response).encode() + b"\n")
-                    await writer.drain()
-        except (asyncio.CancelledError, ConnectionResetError):
-            pass
-        finally:
-            # Remove client on disconnect
-            client_id = None
-            for cid, info in list(self._clients.items()):
-                if info.address[0] == peer[0]:
-                    client_id = cid
-                    break
-            if client_id:
-                del self._clients[client_id]
-                logger.info("Client disconnected: %s", client_id)
-            writer.close()
-
-    def _process_message(
-        self, msg: dict, peer: tuple[str, int]
-    ) -> dict | None:
-        """Process a control message from a client."""
-        msg_type = msg.get("type")
-
-        if msg_type == "REGISTER":
-            client_id = msg.get("client_id", "")
-            hostname = msg.get("hostname", "unknown")
-            platform = msg.get("platform", "unknown")
-            udp_port = msg.get("udp_port", DEFAULT_UDP_PORT)
-
-            screen_width = msg.get("screen_width", 1920)
-            screen_height = msg.get("screen_height", 1080)
-
-            self._clients[client_id] = ClientInfo(
-                client_id=client_id,
-                hostname=hostname,
-                platform=platform,
-                address=(peer[0], udp_port),
-                screen_width=screen_width,
-                screen_height=screen_height,
-            )
-            import platform as platform_mod
-            logger.info("Client registered: %s (%s) at %s:%d", hostname, platform, peer[0], udp_port)
-            self._on_client_connected.set()
-            return {
-                "type": "REGISTERED",
-                "status": "ok",
-                "server_hostname": platform_mod.node(),
+            # Send SERVER_HELLO
+            hello = {
+                "type": "SERVER_HELLO",
+                "hostname": platform.node(),
             }
+            writer.write(json.dumps(hello).encode() + b"\n")
+            await writer.drain()
 
-        elif msg_type == "HEARTBEAT":
-            client_id = msg.get("client_id", "")
-            if client_id in self._clients:
-                self._clients[client_id].last_heartbeat = time.monotonic()
-            return {"type": "HEARTBEAT_ACK"}
+            # Wait for CLIENT_INFO response
+            line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            if not line:
+                writer.close()
+                self._connecting.discard(device_id)
+                return False
 
-        return None
+            msg = json.loads(line.decode())
+            hostname = msg.get("hostname", "unknown")
+            plat = msg.get("platform", "unknown")
+            udp_port = msg.get("udp_port", DEFAULT_UDP_PORT)
+            screen_w = msg.get("screen_width", 1920)
+            screen_h = msg.get("screen_height", 1080)
 
-    async def notify_switch(
-        self, writer: asyncio.StreamWriter, active: bool
+            self._clients[device_id] = ClientInfo(
+                client_id=device_id,
+                hostname=hostname,
+                platform=plat,
+                address=(ip, udp_port),
+                screen_width=screen_w,
+                screen_height=screen_h,
+                writer=writer,
+            )
+            logger.info("Connected to client: %s (%s) at %s:%d [%dx%d]",
+                         hostname, plat, ip, udp_port, screen_w, screen_h)
+
+            # Start heartbeat for this client
+            asyncio.ensure_future(self._heartbeat_loop(device_id, reader, writer))
+            return True
+
+        except (json.JSONDecodeError, asyncio.TimeoutError, OSError) as e:
+            logger.debug("Handshake failed with %s:%d: %s", ip, tcp_port, e)
+            writer.close()
+            return False
+        finally:
+            self._connecting.discard(device_id)
+
+    async def _heartbeat_loop(
+        self, device_id: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        """Notify a client that it is now active or inactive."""
-        msg = {"type": "SWITCH", "active": active}
-        writer.write(json.dumps(msg).encode() + b"\n")
-        await writer.drain()
+        """Send periodic heartbeats to a connected client."""
+        try:
+            while device_id in self._clients and not writer.is_closing():
+                try:
+                    msg = {"type": "HEARTBEAT"}
+                    writer.write(json.dumps(msg).encode() + b"\n")
+                    await writer.drain()
+                    await asyncio.sleep(2.0)
+                except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError,
+                        OSError, asyncio.CancelledError):
+                    break
+        finally:
+            self._disconnect_client(device_id)
+
+    def _disconnect_client(self, device_id: str) -> None:
+        """Remove a disconnected client."""
+        client = self._clients.pop(device_id, None)
+        if client:
+            logger.info("Client disconnected: %s (%s)", client.hostname, device_id)
+            if client.writer:
+                client.writer.close()
+
+    async def disconnect_all(self) -> None:
+        """Disconnect from all clients."""
+        for device_id, client in list(self._clients.items()):
+            if client.writer:
+                client.writer.close()
+                try:
+                    await client.writer.wait_closed()
+                except OSError:
+                    pass
+        self._clients.clear()

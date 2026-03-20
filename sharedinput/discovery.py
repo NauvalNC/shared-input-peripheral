@@ -1,8 +1,8 @@
-"""LAN server discovery via UDP broadcast.
+"""LAN device discovery via UDP broadcast.
 
-The server periodically broadcasts its presence on the local network.
-Clients (or idle tray apps) listen for these announcements to populate
-the "Start as Client" submenu with available servers.
+Every device broadcasts AVAILABLE when the app is running.
+When a device becomes the server, it listens for AVAILABLE broadcasts
+and auto-connects to discovered devices.
 
 Uses only stdlib — no external dependencies.
 """
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DISCOVERY_PORT = 9878
 _BROADCAST_INTERVAL = 2.0  # seconds between announcements
-_SERVER_TTL = 6.0  # seconds before a server is considered gone
+_DEVICE_TTL = 6.0  # seconds before a device is considered gone
 
 
 def _get_local_ip() -> str:
@@ -51,20 +51,20 @@ def _get_subnet_broadcast(local_ip: str) -> str | None:
 
 
 @dataclass
-class ServerInfo:
-    """A discovered server on the LAN."""
-    server_id: str
+class DeviceInfo:
+    """A discovered device on the LAN."""
+    device_id: str
     hostname: str
     ip: str
     tcp_port: int
     last_seen: float = field(default_factory=time.monotonic)
 
 
-class DiscoveryBroadcaster:
-    """Broadcasts server presence on the LAN via UDP.
+class DeviceBroadcaster:
+    """Broadcasts this device's presence on the LAN via UDP.
 
-    Used by the server to announce itself so that clients can discover
-    it without manual IP configuration.
+    ALL devices run this when the app is open — not just servers.
+    This allows servers to discover available devices to connect to.
     """
 
     def __init__(
@@ -74,27 +74,29 @@ class DiscoveryBroadcaster:
     ) -> None:
         self._tcp_port = tcp_port
         self._discovery_port = discovery_port
-        self._server_id = str(uuid.uuid4())[:8]
+        self._device_id = str(uuid.uuid4())[:8]
         self._hostname = platform.node()
         self._running = False
         self._thread: threading.Thread | None = None
 
+    @property
+    def device_id(self) -> str:
+        return self._device_id
+
     def start(self) -> None:
-        """Start broadcasting in a background thread."""
         if self._running:
             return
         self._running = True
         self._thread = threading.Thread(target=self._broadcast_loop, daemon=True)
         self._thread.start()
-        logger.info("Discovery broadcaster started on port %d", self._discovery_port)
+        logger.info("Device broadcaster started (port %d, id=%s)", self._discovery_port, self._device_id)
 
     def stop(self) -> None:
-        """Stop broadcasting."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=3.0)
             self._thread = None
-        logger.info("Discovery broadcaster stopped")
+        logger.info("Device broadcaster stopped")
 
     def _broadcast_loop(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -103,17 +105,14 @@ class DiscoveryBroadcaster:
 
         local_ip = _get_local_ip()
         payload = json.dumps({
-            "type": "ANNOUNCE",
-            "server_id": self._server_id,
+            "type": "AVAILABLE",
+            "device_id": self._device_id,
             "hostname": self._hostname,
             "ip": local_ip,
             "tcp_port": self._tcp_port,
-            "version": 1,
         }).encode()
 
-        # Build list of broadcast targets
         targets = [("255.255.255.255", self._discovery_port)]
-        # Also try subnet broadcast (e.g., 192.168.1.255)
         subnet_broadcast = _get_subnet_broadcast(local_ip)
         if subnet_broadcast and subnet_broadcast != "255.255.255.255":
             targets.append((subnet_broadcast, self._discovery_port))
@@ -130,65 +129,60 @@ class DiscoveryBroadcaster:
             sock.close()
 
 
-class DiscoveryListener:
-    """Listens for server announcements on the LAN.
+class DeviceListener:
+    """Listens for AVAILABLE device broadcasts on the LAN.
 
-    Used by the tray app (when idle) to discover available servers.
-    When ``on_server_found`` is set, it fires once when the first
-    server is discovered — used for auto-connect.
+    Used by the server to discover devices it can connect to.
+    Fires ``on_device_found`` for each newly discovered device.
     """
 
     def __init__(
         self,
         discovery_port: int = DEFAULT_DISCOVERY_PORT,
-        on_server_found: Callable[[ServerInfo], None] | None = None,
+        on_device_found: Callable[[DeviceInfo], None] | None = None,
+        ignore_device_id: str = "",
     ) -> None:
         self._discovery_port = discovery_port
-        self._servers: dict[str, ServerInfo] = {}
+        self._devices: dict[str, DeviceInfo] = {}
         self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
-        self._on_server_found = on_server_found
-        self._callback_fired = False
+        self._on_device_found = on_device_found
+        self._ignore_device_id = ignore_device_id  # skip own broadcasts
 
     @property
-    def servers(self) -> dict[str, ServerInfo]:
-        """Return a snapshot of discovered servers (thread-safe)."""
+    def devices(self) -> dict[str, DeviceInfo]:
+        """Return a snapshot of discovered devices (thread-safe)."""
         with self._lock:
-            # Prune expired servers
             now = time.monotonic()
             expired = [
-                sid for sid, info in self._servers.items()
-                if now - info.last_seen > _SERVER_TTL
+                did for did, info in self._devices.items()
+                if now - info.last_seen > _DEVICE_TTL
             ]
-            for sid in expired:
-                del self._servers[sid]
-            return dict(self._servers)
+            for did in expired:
+                del self._devices[did]
+            return dict(self._devices)
 
     def start(self) -> None:
-        """Start listening in a background thread."""
         if self._running:
             return
         self._running = True
-        self._callback_fired = False
         self._thread = threading.Thread(target=self._listen_loop, daemon=True)
         self._thread.start()
-        logger.info("Discovery listener started on port %d", self._discovery_port)
+        logger.info("Device listener started on port %d", self._discovery_port)
 
     def stop(self) -> None:
-        """Stop listening."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=3.0)
             self._thread = None
         with self._lock:
-            self._servers.clear()
-        logger.info("Discovery listener stopped")
+            self._devices.clear()
+        logger.info("Device listener stopped")
 
     def _listen_loop(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # SO_REUSEPORT allows multiple listeners on macOS/Linux
         if sys.platform != "win32" and hasattr(socket, "SO_REUSEPORT"):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         sock.bind(("", self._discovery_port))
@@ -203,7 +197,7 @@ class DiscoveryListener:
                     continue
                 except OSError as e:
                     if self._running:
-                        logger.debug("Discovery listen error: %s", e)
+                        logger.debug("Device listen error: %s", e)
         finally:
             sock.close()
 
@@ -213,16 +207,19 @@ class DiscoveryListener:
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
 
-        if msg.get("type") != "ANNOUNCE":
+        if msg.get("type") != "AVAILABLE":
             return
 
-        server_id = msg.get("server_id", "")
+        device_id = msg.get("device_id", "")
+        if device_id == self._ignore_device_id:
+            return  # skip own broadcasts
+
         hostname = msg.get("hostname", "unknown")
         ip = msg.get("ip", addr[0])
         tcp_port = msg.get("tcp_port", 9877)
 
-        info = ServerInfo(
-            server_id=server_id,
+        info = DeviceInfo(
+            device_id=device_id,
             hostname=hostname,
             ip=ip,
             tcp_port=tcp_port,
@@ -230,10 +227,9 @@ class DiscoveryListener:
         )
 
         with self._lock:
-            is_new = server_id not in self._servers
-            self._servers[server_id] = info
+            is_new = device_id not in self._devices
+            self._devices[device_id] = info
 
-        # Fire auto-connect callback on first server discovery
-        if is_new and self._on_server_found and not self._callback_fired:
-            self._callback_fired = True
-            self._on_server_found(info)
+        if is_new and self._on_device_found:
+            logger.info("New device discovered: %s (%s)", hostname, ip)
+            self._on_device_found(info)

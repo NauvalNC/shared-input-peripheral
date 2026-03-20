@@ -1,8 +1,9 @@
-"""Client networking — UDP receiver for input events + TCP control client.
+"""Client networking — UDP receiver for input events + TCP control server.
 
-The UDP receiver listens for serialized input events from the server and
-passes them to the injector.  The TCP control client handles registration
-and heartbeats.
+The client is PASSIVE: it runs a TCP control server and waits for the
+server to connect to it (the server discovers devices via UDP broadcast
+and initiates TCP connections).  Once connected, the client receives
+input events via UDP and injects them locally.
 """
 
 from __future__ import annotations
@@ -34,23 +35,20 @@ class UDPReceiver:
         self._running = False
 
     def start(self) -> None:
-        """Bind the UDP socket and start listening."""
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind((self._host, self._port))
-        self._sock.settimeout(0.1)  # Non-blocking with short timeout
+        self._sock.settimeout(0.1)
         self._running = True
         logger.info("UDP receiver listening on %s:%d", self._host, self._port)
 
     def stop(self) -> None:
-        """Stop listening and close the socket."""
         self._running = False
         if self._sock:
             self._sock.close()
             self._sock = None
 
     def receive(self) -> InputEvent | None:
-        """Try to receive and deserialize one event. Returns None on timeout."""
         if not self._sock or not self._running:
             return None
         try:
@@ -63,107 +61,45 @@ class UDPReceiver:
             return None
 
 
-class ControlClient:
-    """TCP control client — registers with the server and sends heartbeats."""
+class ClientControlServer:
+    """TCP control server on the CLIENT side.
+
+    Accepts incoming connections from the SharedInput server.
+    The server connects to us (we don't connect to the server).
+    """
 
     def __init__(
         self,
-        server_host: str,
-        server_port: int = DEFAULT_TCP_PORT,
+        host: str = "0.0.0.0",
+        port: int = DEFAULT_TCP_PORT,
         udp_port: int = DEFAULT_UDP_PORT,
     ) -> None:
-        self._server_host = server_host
-        self._server_port = server_port
+        self._host = host
+        self._port = port
         self._udp_port = udp_port
-        self._client_id = str(uuid.uuid4())[:8]
         self._hostname = platform.node()
-        self._platform = platform.system()
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
-        self._active = False
+        self._platform_name = platform.system()
+        self._tcp_server: asyncio.Server | None = None
         self._server_hostname: str = ""
-
-    @property
-    def is_active(self) -> bool:
-        return self._active
-
-    @property
-    def client_id(self) -> str:
-        return self._client_id
+        self._connected = False
+        self._writer: asyncio.StreamWriter | None = None
 
     @property
     def server_hostname(self) -> str:
         return self._server_hostname
 
-    async def connect(self) -> None:
-        """Connect to the server control plane."""
-        self._reader, self._writer = await asyncio.open_connection(
-            self._server_host, self._server_port
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    async def start(self) -> None:
+        """Start TCP server, waiting for the server to connect to us."""
+        self._tcp_server = await asyncio.start_server(
+            self._handle_server_connection, self._host, self._port
         )
-        logger.info("Connected to control server at %s:%d", self._server_host, self._server_port)
+        logger.info("Client control server listening on %s:%d", self._host, self._port)
 
-        # Get screen resolution to send to server for mouse scaling
-        from sharedinput.platform import get_screen_resolution
-        screen_w, screen_h = get_screen_resolution()
-
-        # Register
-        msg = {
-            "type": "REGISTER",
-            "client_id": self._client_id,
-            "hostname": self._hostname,
-            "platform": self._platform,
-            "udp_port": self._udp_port,
-            "screen_width": screen_w,
-            "screen_height": screen_h,
-        }
-        self._writer.write(json.dumps(msg).encode() + b"\n")
-        await self._writer.drain()
-
-        # Wait for registration response
-        line = await self._reader.readline()
-        if line:
-            try:
-                response = json.loads(line.decode())
-                logger.info("Registration response: %s", response)
-                self._server_hostname = response.get("server_hostname", "")
-            except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                logger.warning("Invalid registration response: %s", e)
-
-    async def heartbeat_loop(self) -> None:
-        """Send periodic heartbeats to the server."""
-        while self._writer and not self._writer.is_closing():
-            try:
-                msg = {"type": "HEARTBEAT", "client_id": self._client_id}
-                self._writer.write(json.dumps(msg).encode() + b"\n")
-                await self._writer.drain()
-                await asyncio.sleep(2.0)
-            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError,
-                    OSError, asyncio.CancelledError):
-                break
-
-    async def listen_for_commands(self) -> None:
-        """Listen for control commands from the server (e.g., SWITCH)."""
-        if not self._reader:
-            return
-
-        while True:
-            try:
-                line = await self._reader.readline()
-                if not line:
-                    break
-                msg = json.loads(line.decode())
-                if msg.get("type") == "SWITCH":
-                    self._active = msg.get("active", False)
-                    status = "ACTIVE" if self._active else "INACTIVE"
-                    logger.info("Switch notification: now %s", status)
-                elif msg.get("type") == "HEARTBEAT_ACK":
-                    pass
-            except (json.JSONDecodeError, UnicodeDecodeError, ConnectionResetError,
-                    BrokenPipeError, OSError, asyncio.CancelledError):
-                break
-
-    async def disconnect(self) -> None:
-        """Disconnect from the server."""
+    async def stop(self) -> None:
         if self._writer:
             self._writer.close()
             try:
@@ -171,4 +107,68 @@ class ControlClient:
             except OSError:
                 pass
             self._writer = None
-            self._reader = None
+        if self._tcp_server:
+            self._tcp_server.close()
+            await self._tcp_server.wait_closed()
+        self._connected = False
+
+    async def _handle_server_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """Handle incoming TCP connection from the server."""
+        peer = writer.get_extra_info("peername")
+        logger.info("Server connected from %s", peer)
+        self._writer = writer
+        self._connected = True
+
+        try:
+            # Read the SERVER_HELLO
+            line = await reader.readline()
+            if line:
+                try:
+                    msg = json.loads(line.decode())
+                    if msg.get("type") == "SERVER_HELLO":
+                        self._server_hostname = msg.get("hostname", "")
+                        logger.info("Server identified: %s", self._server_hostname)
+
+                        # Send our info back
+                        from sharedinput.platform import get_screen_resolution
+                        screen_w, screen_h = get_screen_resolution()
+
+                        response = {
+                            "type": "CLIENT_INFO",
+                            "hostname": self._hostname,
+                            "platform": self._platform_name,
+                            "udp_port": self._udp_port,
+                            "screen_width": screen_w,
+                            "screen_height": screen_h,
+                        }
+                        writer.write(json.dumps(response).encode() + b"\n")
+                        await writer.drain()
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    logger.warning("Invalid server message: %s", e)
+
+            # Listen for commands (SWITCH, etc.)
+            while True:
+                try:
+                    line = await reader.readline()
+                    if not line:
+                        break
+                    msg = json.loads(line.decode())
+                    msg_type = msg.get("type")
+                    if msg_type == "HEARTBEAT":
+                        writer.write(json.dumps({"type": "HEARTBEAT_ACK"}).encode() + b"\n")
+                        await writer.drain()
+                except (json.JSONDecodeError, UnicodeDecodeError, ConnectionResetError,
+                        BrokenPipeError, OSError, asyncio.CancelledError):
+                    break
+
+        finally:
+            self._connected = False
+            self._server_hostname = ""
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+            logger.info("Server disconnected")

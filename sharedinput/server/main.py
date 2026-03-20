@@ -1,4 +1,8 @@
-"""Server orchestration — wires capture, network, and switcher together."""
+"""Server orchestration — wires capture, network, and switcher together.
+
+The server discovers devices on the LAN, connects to them as clients,
+captures input from peripherals, and forwards to the active client.
+"""
 
 from __future__ import annotations
 
@@ -10,11 +14,11 @@ import sys
 import threading
 
 from sharedinput.config import Config
-from sharedinput.discovery import DiscoveryBroadcaster
+from sharedinput.discovery import DeviceBroadcaster, DeviceInfo, DeviceListener
 from sharedinput.platform import get_screen_resolution
 from sharedinput.protocol import MouseMoveEvent
 from sharedinput.server.capture import InputCapture, install_macos_tap, stop_macos_tap, use_macos_backend
-from sharedinput.server.network import ControlServer, UDPSender
+from sharedinput.server.network import ClientConnector, UDPSender
 from sharedinput.server.switcher import HotkeySwitcher
 
 logger = logging.getLogger(__name__)
@@ -26,31 +30,33 @@ class Server:
     def __init__(self, config: Config) -> None:
         self._config = config
         self._udp_sender = UDPSender(port=config.network.udp_port)
-        self._control_server = ControlServer(port=config.network.tcp_port)
+        self._connector = ClientConnector()
         self._switcher = HotkeySwitcher(on_switch=self._on_switch)
-        self._broadcaster = DiscoveryBroadcaster(
-            tcp_port=config.network.tcp_port,
-            discovery_port=config.network.discovery_port,
-        )
+        self._broadcaster: DeviceBroadcaster | None = None  # set by tray
+        self._listener: DeviceListener | None = None
         self._capture: InputCapture | None = None
         self._forwarding = False
-        self._shutdown_flag = threading.Event()  # thread-safe for shutdown()
+        self._shutdown_flag = threading.Event()
         self._macos_tap_installed = False
         self._server_screen_w, self._server_screen_h = get_screen_resolution()
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    @property
+    def _control_server(self):
+        """Backwards compat — tray accesses this for client list."""
+        return self._connector
 
     def _on_event(self, event) -> None:
         """Callback from input capture — forward event and detect hotkeys."""
         try:
             from sharedinput.protocol import KeyPressEvent, KeyReleaseEvent
 
-            # Feed key events to the switcher for hotkey detection (macOS event-fed mode)
             if isinstance(event, KeyPressEvent):
                 self._switcher.feed_key_press(event.keycode)
             elif isinstance(event, KeyReleaseEvent):
                 self._switcher.feed_key_release(event.keycode)
 
             if self._forwarding:
-                # Scale mouse deltas to match client screen resolution
                 if isinstance(event, MouseMoveEvent):
                     event = self._scale_mouse_event(event)
                 self._udp_sender.send(event)
@@ -58,17 +64,12 @@ class Server:
             logger.warning("Error processing input event", exc_info=True)
 
     def _scale_mouse_event(self, event: MouseMoveEvent) -> MouseMoveEvent:
-        """Scale mouse deltas from server resolution to active client resolution."""
         active_id = self._switcher.active_client_id
         if not active_id:
             return event
-
-        clients = self._control_server.clients
-        client = clients.get(active_id)
+        client = self._connector.clients.get(active_id)
         if not client:
             return event
-
-        # Scale based on width ratio (most common axis for mouse sensitivity)
         if self._server_screen_w and client.screen_width:
             scale_x = client.screen_width / self._server_screen_w
             scale_y = client.screen_height / self._server_screen_h
@@ -82,40 +83,46 @@ class Server:
         return event
 
     def _on_switch(self, client_id: str | None) -> None:
-        """Callback from switcher — update forwarding target."""
         if client_id is None:
             self._udp_sender.clear_target()
             self._forwarding = False
             logger.info("Now controlling: LOCAL")
         else:
-            clients = self._control_server.clients
+            clients = self._connector.clients
             if client_id in clients:
                 client = clients[client_id]
                 self._udp_sender.set_target(*client.address)
                 self._forwarding = True
                 logger.info("Now controlling: %s (%s)", client.hostname, client.address[0])
 
-    def install_capture_on_main_thread(self) -> None:
-        """Install the macOS CGEventTap on the main thread.
+    def _on_device_found(self, device: DeviceInfo) -> None:
+        """Called when a new device is discovered — auto-connect to it."""
+        if self._loop:
+            asyncio.run_coroutine_threadsafe(
+                self._connector.connect_to_device(device.device_id, device.ip, device.tcp_port),
+                self._loop,
+            )
 
-        Call this from the main thread BEFORE the run loop starts
-        (e.g. in pystray's setup callback).  On non-macOS platforms
-        this is a no-op — capture is started in ``run()`` instead.
-        """
+    def install_capture_on_main_thread(self) -> None:
         if use_macos_backend():
             ok = install_macos_tap(self._on_event)
             self._macos_tap_installed = ok
             if ok:
                 logger.info("macOS capture installed on main thread")
 
+    def set_broadcaster(self, broadcaster: DeviceBroadcaster) -> None:
+        """Set the broadcaster so we can use its device_id to filter."""
+        self._broadcaster = broadcaster
+
     async def _monitor_clients(self) -> None:
-        """Periodically update the switcher with the current client list."""
         while not self._shutdown_flag.is_set():
-            self._switcher.update_clients(self._control_server.clients)
+            self._switcher.update_clients(self._connector.clients)
             await asyncio.sleep(1.0)
 
     async def run(self) -> None:
         """Run the server."""
+        self._loop = asyncio.get_event_loop()
+
         # Platform checks (skip if tray mode already handled it)
         if not self._macos_tap_installed:
             if sys.platform == "darwin":
@@ -125,11 +132,14 @@ class Server:
                 from sharedinput.platform.windows import warn_if_not_admin
                 warn_if_not_admin()
 
-        # Start control server
-        await self._control_server.start()
-
-        # Start discovery broadcaster
-        self._broadcaster.start()
+        # Start device listener to discover clients
+        ignore_id = self._broadcaster.device_id if self._broadcaster else ""
+        self._listener = DeviceListener(
+            discovery_port=self._config.network.discovery_port,
+            on_device_found=self._on_device_found,
+            ignore_device_id=ignore_id,
+        )
+        self._listener.start()
 
         # Start hotkey switcher
         self._switcher.start()
@@ -137,7 +147,6 @@ class Server:
         # Start input capture (non-macOS, or macOS CLI mode)
         if not self._macos_tap_installed:
             if use_macos_backend():
-                # CLI mode on macOS — install tap here (we ARE the main thread)
                 install_macos_tap(self._on_event)
                 self._macos_tap_installed = True
             else:
@@ -145,12 +154,11 @@ class Server:
                 self._capture.start()
 
         local_ip = _get_local_ip()
-        logger.info("Server started — IP: %s, TCP: %d, UDP: %d",
-                     local_ip, self._config.network.tcp_port, self._config.network.udp_port)
-        logger.info("Waiting for clients to connect...")
+        logger.info("Server started — IP: %s, UDP: %d",
+                     local_ip, self._config.network.udp_port)
+        logger.info("Listening for devices on LAN...")
         logger.info("Hotkey: Ctrl+Alt+Arrow to switch devices")
 
-        # Run until shutdown
         try:
             await self._monitor_clients()
         except asyncio.CancelledError:
@@ -159,14 +167,11 @@ class Server:
             self._cleanup()
 
     def switch_to_client(self, client_id: str | None) -> None:
-        """Programmatically switch input to a client (or None for local).
-
-        Used by the tray menu's "Switch Input" submenu.
-        """
         self._switcher.switch_to(client_id)
 
     def _cleanup(self) -> None:
-        self._broadcaster.stop()
+        if self._listener:
+            self._listener.stop()
         if self._capture:
             self._capture.stop()
         if self._macos_tap_installed:
@@ -179,7 +184,6 @@ class Server:
 
 
 def _get_local_ip() -> str:
-    """Get the machine's local network IP address."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -191,11 +195,7 @@ def _get_local_ip() -> str:
 
 
 def run_server(config: Config) -> None:
-    """Entry point to run the server (CLI mode).
-
-    On macOS, the main thread must run a CFRunLoop for CGEventTap.
-    We run asyncio in a background thread and use CFRunLoopRun on main.
-    """
+    """Entry point to run the server (CLI mode)."""
     server = Server(config)
 
     if use_macos_backend():
@@ -205,7 +205,6 @@ def run_server(config: Config) -> None:
 
 
 def _run_server_default(server: Server) -> None:
-    """Run server with asyncio on the main thread (Windows/Linux)."""
     loop = asyncio.new_event_loop()
 
     def signal_handler():
@@ -224,13 +223,10 @@ def _run_server_default(server: Server) -> None:
 
 
 def _run_server_macos(server: Server) -> None:
-    """Run server on macOS: CGEventTap on main thread, asyncio in background."""
     import Quartz
 
-    # Install the CGEventTap on the main thread
     server.install_capture_on_main_thread()
 
-    # Run asyncio in a background thread
     loop = asyncio.new_event_loop()
 
     def bg_run():
@@ -241,13 +237,11 @@ def _run_server_macos(server: Server) -> None:
             logger.exception("Server error in background thread")
         finally:
             loop.close()
-            # Stop the main CFRunLoop when server shuts down
             Quartz.CFRunLoopStop(Quartz.CFRunLoopGetMain())
 
     bg_thread = threading.Thread(target=bg_run, daemon=True)
     bg_thread.start()
 
-    # Run the main CFRunLoop (needed for CGEventTap callbacks)
     try:
         Quartz.CFRunLoopRun()
     except KeyboardInterrupt:
