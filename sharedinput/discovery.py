@@ -57,6 +57,7 @@ class DeviceInfo:
     hostname: str
     ip: str
     tcp_port: int
+    role: str = "idle"  # "idle" or "server"
     last_seen: float = field(default_factory=time.monotonic)
 
 
@@ -76,12 +77,17 @@ class DeviceBroadcaster:
         self._discovery_port = discovery_port
         self._device_id = str(uuid.uuid4())[:8]
         self._hostname = platform.node()
+        self._role = "idle"  # "idle" or "server"
         self._running = False
         self._thread: threading.Thread | None = None
 
     @property
     def device_id(self) -> str:
         return self._device_id
+
+    def set_role(self, role: str) -> None:
+        """Update the broadcasted role ('idle' or 'server')."""
+        self._role = role
 
     def start(self) -> None:
         if self._running:
@@ -104,14 +110,6 @@ class DeviceBroadcaster:
         sock.settimeout(1.0)
 
         local_ip = _get_local_ip()
-        payload = json.dumps({
-            "type": "AVAILABLE",
-            "device_id": self._device_id,
-            "hostname": self._hostname,
-            "ip": local_ip,
-            "tcp_port": self._tcp_port,
-        }).encode()
-
         targets = [("255.255.255.255", self._discovery_port)]
         subnet_broadcast = _get_subnet_broadcast(local_ip)
         if subnet_broadcast and subnet_broadcast != "255.255.255.255":
@@ -119,6 +117,15 @@ class DeviceBroadcaster:
 
         try:
             while self._running:
+                # Re-encode each loop so role changes are picked up
+                payload = json.dumps({
+                    "type": "AVAILABLE",
+                    "device_id": self._device_id,
+                    "hostname": self._hostname,
+                    "ip": local_ip,
+                    "tcp_port": self._tcp_port,
+                    "role": self._role,
+                }).encode()
                 for target in targets:
                     try:
                         sock.sendto(payload, target)
@@ -217,12 +224,18 @@ class DeviceListener:
         hostname = msg.get("hostname", "unknown")
         ip = msg.get("ip", addr[0])
         tcp_port = msg.get("tcp_port", 9877)
+        role = msg.get("role", "idle")
+
+        # Skip other servers — only discover idle (client) devices
+        if role == "server":
+            return
 
         info = DeviceInfo(
             device_id=device_id,
             hostname=hostname,
             ip=ip,
             tcp_port=tcp_port,
+            role=role,
             last_seen=time.monotonic(),
         )
 

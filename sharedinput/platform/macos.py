@@ -311,10 +311,12 @@ if _HAS_QUARTZ:
         def set_suppressing(self, suppressing: bool) -> None:
             """Toggle input suppression. When True, local input is blocked."""
             self._suppressing = suppressing
-            # Disconnect/reconnect hardware mouse from cursor position
-            # Without this, the cursor still tracks physical mouse movement
-            # even though events are suppressed
+            # Disconnect hardware mouse from cursor and hide cursor
             Quartz.CGAssociateMouseAndMouseCursorPosition(not suppressing)
+            if suppressing:
+                Quartz.CGDisplayHideCursor(Quartz.CGMainDisplayID())
+            else:
+                Quartz.CGDisplayShowCursor(Quartz.CGMainDisplayID())
             logger.info("Input suppression: %s", "ON" if suppressing else "OFF")
 
         def _tap_callback(self, proxy, event_type, cg_event, refcon):

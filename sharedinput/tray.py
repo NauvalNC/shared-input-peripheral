@@ -59,10 +59,12 @@ class TrayApp:
             discovery_port=self._config.network.discovery_port,
         )
 
-        # Snapshots for menu
+        # Snapshots for menu (cached in _update_snapshots)
         self._connected_clients: list[tuple[str, str]] = []  # server-side
         self._client_device_list: list[tuple[str | None, str]] = []  # client-side (id, hostname)
         self._client_active_device_id: str | None = None  # client-side active device
+        self._client_connected: bool = False  # cached connection state
+        self._client_server_name: str = ""  # cached server hostname
 
         # Icons
         self._icon_default = create_default_icon(64)
@@ -132,19 +134,15 @@ class TrayApp:
             visible=lambda item, i=idx: i < len(self._client_device_list),
         )
 
-    @property
-    def _is_client_connected(self) -> bool:
-        return bool(self._client and self._client._control.is_connected)
-
     def _build_idle_menu(self) -> list:
         items = []
         ip = _get_local_ip()
 
-        # "Connected to [server]" — visible only when connected
+        # Status label — uses cached state
         items.append(pystray.MenuItem(
             lambda item: (
-                f"Connected to {self._client._control.server_hostname or 'server'}"
-                if self._is_client_connected else f"Ready on {ip}"
+                f"Connected to {self._client_server_name or 'server'}"
+                if self._client_connected else f"Ready on {ip}"
             ),
             None,
             enabled=False,
@@ -161,17 +159,17 @@ class TrayApp:
                 "Switch Input",
                 pystray.Menu(*switch_items),
                 visible=lambda item: (
-                    self._is_client_connected
+                    self._client_connected
                     and len(self._client_device_list) > 1
                 ),
             )
         )
 
         items.append(pystray.Menu.SEPARATOR)
+        # Start as Server — always visible
         items.append(pystray.MenuItem(
             "Start as Server",
             self._on_start_server,
-            visible=lambda item: not self._is_client_connected,
         ))
         return items
 
@@ -269,14 +267,18 @@ class TrayApp:
         else:
             self._connected_clients = []
 
-        # Client-side device list from server
+        # Client-side state from server
         if self._client and self._client._control.is_connected:
+            self._client_connected = True
+            self._client_server_name = self._client._control.server_hostname or ""
             self._client_device_list = [
                 (d.get("id"), d.get("hostname", "unknown"))
                 for d in self._client._control.device_list
             ]
             self._client_active_device_id = self._client._control.active_device_id
         else:
+            self._client_connected = False
+            self._client_server_name = ""
             self._client_device_list = []
             self._client_active_device_id = None
 
@@ -285,7 +287,11 @@ class TrayApp:
     def _on_start_server(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         if self._running_role == "server":
             return
+        # Disconnect from any current server and stop passive client
         self._stop_passive_client()
+        self._client_connected = False
+        self._client_server_name = ""
+        self._client_device_list = []
         self._start_server()
 
     def _on_switch_to_local(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
@@ -297,7 +303,7 @@ class TrayApp:
 
     def _on_client_switch_to(self, target_id: str | None) -> None:
         """Client-side: send SWITCH_REQUEST to server."""
-        if self._client and self._client._control.is_connected:
+        if self._client_connected and self._client and self._client._control.is_connected:
             import asyncio
             # Send async from main thread
             loop = asyncio.new_event_loop()
@@ -375,6 +381,7 @@ class TrayApp:
                 return
 
         self._config.role = "server"
+        self._broadcaster.set_role("server")  # stop being discoverable as client
         self._server = Server(self._config)
         self._server.set_broadcaster(self._broadcaster)
         self._running_role = "server"
@@ -405,6 +412,7 @@ class TrayApp:
             self._server = None
         if self._running_role == "server":
             self._running_role = None
+        self._broadcaster.set_role("idle")  # become discoverable again
         self._connected_clients = []
         self._update_icon_state()
 

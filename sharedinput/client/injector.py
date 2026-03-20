@@ -74,7 +74,9 @@ class InputInjector:
 
     def _inject_mouse_move(self, event: MouseMoveEvent) -> None:
         if _HAS_QUARTZ:
-            # Use Quartz directly to avoid snap-back issues on macOS
+            # Use CGWarpMouseCursorPosition for reliable cursor control on macOS.
+            # Unlike CGEventPost, this directly sets the cursor position without
+            # creating events that get re-processed and cause snap-back.
             self._mac_mouse_x += event.dx
             self._mac_mouse_y += event.dy
             # Clamp to screen bounds
@@ -83,10 +85,10 @@ class InputInjector:
             self._mac_mouse_x = max(0, min(screen_w - 1, self._mac_mouse_x))
             self._mac_mouse_y = max(0, min(screen_h - 1, self._mac_mouse_y))
             point = Quartz.CGPointMake(self._mac_mouse_x, self._mac_mouse_y)
-            move_event = Quartz.CGEventCreateMouseEvent(
-                None, Quartz.kCGEventMouseMoved, point, Quartz.kCGMouseButtonLeft
-            )
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, move_event)
+            # Warp cursor directly (no event re-processing)
+            Quartz.CGWarpMouseCursorPosition(point)
+            # Re-associate so the next warp works (macOS disassociates after warp)
+            Quartz.CGAssociateMouseAndMouseCursorPosition(True)
         else:
             self._mouse.move(event.dx, event.dy)
 
@@ -103,7 +105,7 @@ class InputInjector:
                 etype = Quartz.kCGEventOtherMouseDown if event.pressed else Quartz.kCGEventOtherMouseUp
                 btn = Quartz.kCGMouseButtonCenter
             click_event = Quartz.CGEventCreateMouseEvent(None, etype, point, btn)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, click_event)
+            Quartz.CGEventPost(Quartz.kCGSessionEventTap, click_event)
         else:
             button = _BUTTON_MAP.get(event.button, mouse.Button.left)
             if event.pressed:
@@ -143,6 +145,11 @@ class InputInjector:
 
         # Printable character (single char)
         if len(name) == 1:
+            # For alphabetic keys, use virtual keycode so modifier combos work
+            # (from_char sends the character directly which can conflict with
+            # held modifiers like Shift or Ctrl on Windows)
+            if name.isalpha() and sys.platform == "win32":
+                return KeyCode.from_vk(ord(name.upper()))
             return KeyCode.from_char(name)
 
         # Map names that differ between macOS CGEventTap and pynput
