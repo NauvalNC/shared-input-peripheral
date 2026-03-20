@@ -12,6 +12,7 @@ import json
 import logging
 import platform
 import socket
+import struct
 import time
 import uuid
 
@@ -57,7 +58,7 @@ class UDPReceiver:
             return deserialize(data)
         except socket.timeout:
             return None
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, struct.error) as e:
             logger.debug("UDP receive error: %s", e)
             return None
 
@@ -110,8 +111,11 @@ class ControlClient:
         # Wait for registration response
         line = await self._reader.readline()
         if line:
-            response = json.loads(line.decode())
-            logger.info("Registration response: %s", response)
+            try:
+                response = json.loads(line.decode())
+                logger.info("Registration response: %s", response)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                logger.warning("Invalid registration response: %s", e)
 
     async def heartbeat_loop(self) -> None:
         """Send periodic heartbeats to the server."""
@@ -121,7 +125,8 @@ class ControlClient:
                 self._writer.write(json.dumps(msg).encode() + b"\n")
                 await self._writer.drain()
                 await asyncio.sleep(2.0)
-            except (ConnectionResetError, asyncio.CancelledError):
+            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError,
+                    OSError, asyncio.CancelledError):
                 break
 
     async def listen_for_commands(self) -> None:
@@ -141,12 +146,17 @@ class ControlClient:
                     logger.info("Switch notification: now %s", status)
                 elif msg.get("type") == "HEARTBEAT_ACK":
                     pass
-            except (json.JSONDecodeError, ConnectionResetError, asyncio.CancelledError):
+            except (json.JSONDecodeError, UnicodeDecodeError, ConnectionResetError,
+                    BrokenPipeError, OSError, asyncio.CancelledError):
                 break
 
     async def disconnect(self) -> None:
         """Disconnect from the server."""
         if self._writer:
             self._writer.close()
+            try:
+                await self._writer.wait_closed()
+            except OSError:
+                pass
             self._writer = None
             self._reader = None

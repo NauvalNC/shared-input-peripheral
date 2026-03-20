@@ -1,17 +1,21 @@
-"""Input capture — wraps pynput listeners to emit protocol events.
+"""Input capture — wraps pynput listeners (or macOS CGEventTap) to emit events.
 
-Captures mouse and keyboard events and puts them into an event queue
-for the network layer to consume and forward.
+On macOS Tahoe+, pynput's keyboard listener crashes because it calls
+TSM APIs from a background thread.  When running on macOS we use the
+CGEventTap backend from ``platform.macos`` instead, which hooks into the
+main CFRunLoop and avoids the crash.
+
+The CGEventTap is installed separately (via ``install_macos_tap``) because
+it MUST run on the main thread.  The pynput fallback (``InputCapture``)
+works on Windows and Linux, and can be started from any thread.
 """
 
 from __future__ import annotations
 
 import logging
 import queue
-import threading
+import sys
 from typing import Callable
-
-from pynput import keyboard, mouse
 
 from sharedinput.protocol import (
     InputEvent,
@@ -26,8 +30,52 @@ from sharedinput.protocol import (
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# macOS CGEventTap capture (main-thread safe)
+# ---------------------------------------------------------------------------
 
-def _pynput_button_to_mouse_button(button: mouse.Button) -> MouseButton:
+_macos_capture = None  # singleton MacOSCapture instance
+
+
+def use_macos_backend() -> bool:
+    """Return True if we should use the CGEventTap backend."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        from sharedinput.platform.macos import has_quartz
+        return has_quartz()
+    except ImportError:
+        return False
+
+
+def install_macos_tap(event_callback: Callable[[InputEvent], None]) -> bool:
+    """Install a CGEventTap on the main thread's run loop.
+
+    MUST be called from the main thread.  Returns True on success.
+    Call this before the NSApplication / pystray run loop starts
+    (e.g. in pystray's setup callback).
+    """
+    global _macos_capture
+    from sharedinput.platform.macos import MacOSCapture
+
+    _macos_capture = MacOSCapture(event_callback)
+    return _macos_capture.install_tap()
+
+
+def stop_macos_tap() -> None:
+    """Stop and remove the CGEventTap."""
+    global _macos_capture
+    if _macos_capture is not None:
+        _macos_capture.stop()
+        _macos_capture = None
+
+
+# ---------------------------------------------------------------------------
+# pynput-based capture (Windows / Linux / fallback)
+# ---------------------------------------------------------------------------
+
+def _pynput_button_to_mouse_button(button) -> MouseButton:
+    from pynput import mouse
     mapping = {
         mouse.Button.left: MouseButton.LEFT,
         mouse.Button.right: MouseButton.RIGHT,
@@ -36,8 +84,8 @@ def _pynput_button_to_mouse_button(button: mouse.Button) -> MouseButton:
     return mapping.get(button, MouseButton.LEFT)
 
 
-def _key_to_keycode_and_char(key: keyboard.Key | keyboard.KeyCode) -> tuple[int, str]:
-    """Extract a numeric keycode and character string from a pynput key."""
+def _key_to_keycode_and_char(key) -> tuple[int, str]:
+    from pynput import keyboard
     if isinstance(key, keyboard.Key):
         return (key.value.vk if key.value and hasattr(key.value, "vk") else hash(key) & 0xFFFFFFFF, "")
     elif isinstance(key, keyboard.KeyCode):
@@ -48,20 +96,21 @@ def _key_to_keycode_and_char(key: keyboard.Key | keyboard.KeyCode) -> tuple[int,
 
 
 class InputCapture:
-    """Captures mouse and keyboard input, emitting InputEvent objects."""
+    """Captures mouse and keyboard input using pynput (non-macOS)."""
 
     def __init__(self, event_callback: Callable[[InputEvent], None]) -> None:
         self._callback = event_callback
         self._last_mouse_x: int | None = None
         self._last_mouse_y: int | None = None
-        self._mouse_listener: mouse.Listener | None = None
-        self._keyboard_listener: keyboard.Listener | None = None
+        self._mouse_listener = None
+        self._keyboard_listener = None
         self._running = False
 
     def start(self) -> None:
-        """Start capturing input events."""
         if self._running:
             return
+
+        from pynput import keyboard, mouse
 
         self._running = True
         self._mouse_listener = mouse.Listener(
@@ -75,10 +124,9 @@ class InputCapture:
         )
         self._mouse_listener.start()
         self._keyboard_listener.start()
-        logger.info("Input capture started")
+        logger.info("Input capture started (pynput)")
 
     def stop(self) -> None:
-        """Stop capturing input events."""
         self._running = False
         if self._mouse_listener:
             self._mouse_listener.stop()
@@ -89,7 +137,6 @@ class InputCapture:
     def _on_mouse_move(self, x: int, y: int) -> None:
         if not self._running:
             return
-
         if self._last_mouse_x is not None and self._last_mouse_y is not None:
             dx = x - self._last_mouse_x
             dy = y - self._last_mouse_y
@@ -99,51 +146,38 @@ class InputCapture:
                     dy=max(-32768, min(32767, dy)),
                     timestamp=monotonic_ns(),
                 ))
-
         self._last_mouse_x = x
         self._last_mouse_y = y
 
-    def _on_mouse_click(self, x: int, y: int, button: mouse.Button, pressed: bool) -> None:
+    def _on_mouse_click(self, x, y, button, pressed) -> None:
         if not self._running:
             return
-
         self._callback(MouseClickEvent(
             button=_pynput_button_to_mouse_button(button),
             pressed=pressed,
             timestamp=monotonic_ns(),
         ))
 
-    def _on_mouse_scroll(self, x: int, y: int, dx: int, dy: int) -> None:
+    def _on_mouse_scroll(self, x, y, dx, dy) -> None:
         if not self._running:
             return
-
         self._callback(MouseScrollEvent(
             dx=max(-32768, min(32767, dx)),
             dy=max(-32768, min(32767, dy)),
             timestamp=monotonic_ns(),
         ))
 
-    def _on_key_press(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
+    def _on_key_press(self, key) -> None:
         if not self._running or key is None:
             return
-
         keycode, char = _key_to_keycode_and_char(key)
-        self._callback(KeyPressEvent(
-            keycode=keycode,
-            char=char,
-            timestamp=monotonic_ns(),
-        ))
+        self._callback(KeyPressEvent(keycode=keycode, char=char, timestamp=monotonic_ns()))
 
-    def _on_key_release(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
+    def _on_key_release(self, key) -> None:
         if not self._running or key is None:
             return
-
         keycode, char = _key_to_keycode_and_char(key)
-        self._callback(KeyReleaseEvent(
-            keycode=keycode,
-            char=char,
-            timestamp=monotonic_ns(),
-        ))
+        self._callback(KeyReleaseEvent(keycode=keycode, char=char, timestamp=monotonic_ns()))
 
 
 class QueuedCapture:
@@ -151,13 +185,12 @@ class QueuedCapture:
 
     def __init__(self, maxsize: int = 4096) -> None:
         self.queue: queue.Queue[InputEvent] = queue.Queue(maxsize=maxsize)
-        self._capture = InputCapture(event_callback=self._enqueue)
+        self._capture: InputCapture | None = None
 
     def _enqueue(self, event: InputEvent) -> None:
         try:
             self.queue.put_nowait(event)
         except queue.Full:
-            # Drop oldest event to make room
             try:
                 self.queue.get_nowait()
             except queue.Empty:
@@ -165,10 +198,19 @@ class QueuedCapture:
             self.queue.put_nowait(event)
 
     def start(self) -> None:
-        self._capture.start()
+        if use_macos_backend():
+            # macOS: tap is installed on the main thread separately;
+            # just wire the callback here.
+            install_macos_tap(self._enqueue)
+        else:
+            self._capture = InputCapture(event_callback=self._enqueue)
+            self._capture.start()
 
     def stop(self) -> None:
-        self._capture.stop()
+        if use_macos_backend():
+            stop_macos_tap()
+        elif self._capture:
+            self._capture.stop()
 
     def get_event(self, timeout: float = 0.1) -> InputEvent | None:
         try:

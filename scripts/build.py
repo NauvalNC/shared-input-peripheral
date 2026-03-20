@@ -47,6 +47,7 @@ def build_macos() -> None:
         "--windowed",              # .app bundle, no terminal window
         "--onedir",                # directory bundle (more reliable on macOS)
         "--icon", str(icon_path),
+        "--osx-bundle-identifier", "com.sharedinput.app",
         "--add-data", f"{ASSETS}:assets",
         "--add-data", f"{ROOT / 'config' / 'default.toml'}:config",
         "--hidden-import", "pynput.keyboard._darwin",
@@ -62,16 +63,62 @@ def build_macos() -> None:
     subprocess.check_call(cmd, cwd=ROOT)
 
     app_path = DIST / "SharedInput.app"
-    if app_path.exists():
-        print(f"\nBuild successful: {app_path}")
-        print(f"  To run: open {app_path}")
-    else:
-        # onedir mode puts it in a folder
+    if not app_path.exists():
         app_path = DIST / "SharedInput" / "SharedInput.app"
-        if app_path.exists():
-            print(f"\nBuild successful: {app_path}")
-        else:
-            print(f"\nBuild output in: {DIST}")
+
+    if not app_path.exists():
+        print(f"\nBuild output in: {DIST}")
+        return
+
+    # Ad-hoc code sign so macOS treats it as a consistent identity
+    # for Accessibility permissions across rebuilds
+    print("\nAd-hoc signing the .app bundle...")
+    subprocess.check_call([
+        "codesign", "--force", "--deep", "--sign", "-",
+        str(app_path),
+    ])
+    print("  Signed successfully")
+
+    # Create a DMG installer for easy drag-to-Applications install
+    _create_dmg(app_path)
+
+    print(f"\nBuild successful: {app_path}")
+    print(f"  To run: open {app_path}")
+
+
+def _create_dmg(app_path: Path) -> None:
+    """Create a DMG with the .app and a symlink to /Applications."""
+    dmg_path = DIST / "SharedInput.dmg"
+    staging = DIST / "_dmg_staging"
+
+    # Clean previous
+    if dmg_path.exists():
+        dmg_path.unlink()
+    if staging.exists():
+        shutil.rmtree(staging)
+
+    staging.mkdir(parents=True)
+
+    # Copy .app into staging
+    dest_app = staging / "SharedInput.app"
+    shutil.copytree(app_path, dest_app, symlinks=True)
+
+    # Create Applications symlink for drag-to-install
+    (staging / "Applications").symlink_to("/Applications")
+
+    print("Creating DMG installer...")
+    subprocess.check_call([
+        "hdiutil", "create",
+        "-volname", "SharedInput",
+        "-srcfolder", str(staging),
+        "-ov",
+        "-format", "UDZO",  # compressed
+        str(dmg_path),
+    ])
+
+    # Clean staging
+    shutil.rmtree(staging)
+    print(f"  DMG created: {dmg_path}")
 
 
 def build_windows() -> None:

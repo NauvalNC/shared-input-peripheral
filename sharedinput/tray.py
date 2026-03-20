@@ -172,9 +172,27 @@ class TrayApp:
     def _start_server(self) -> None:
         from sharedinput.server.main import Server
 
+        # Check accessibility on macOS before doing anything
+        if sys.platform == "darwin":
+            from sharedinput.platform.macos import ensure_accessibility
+            if not ensure_accessibility(exit_on_fail=False):
+                if self._icon:
+                    self._icon.notify(
+                        "Accessibility permission required.\n"
+                        "Grant it in System Settings → Privacy & Security → Accessibility,\n"
+                        "then try again.",
+                        "SharedInput — Permission Needed",
+                    )
+                return
+
         self._config.role = "server"
         self._server = Server(self._config)
         self._running_role = "server"
+
+        # On macOS, install the CGEventTap on the main thread (we ARE on
+        # the main thread here — pystray menu callbacks run on it).
+        # The tap hooks into pystray's NSApplication run loop.
+        self._server.install_capture_on_main_thread()
 
         def run():
             loop = asyncio.new_event_loop()
@@ -244,10 +262,29 @@ class TrayApp:
 
 def run_tray(config: Config | None = None) -> None:
     """Entry point — launch the system tray app."""
+    from pathlib import Path
+
+    # Log to file so errors are visible even without a terminal
+    log_dir = Path.home() / ".sharedinput"
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / "sharedinput.log"
+
+    handlers: list[logging.Handler] = [
+        logging.FileHandler(log_file, mode="w"),
+    ]
+    # Also log to stderr if available (e.g. launched from terminal)
+    try:
+        handlers.append(logging.StreamHandler())
+    except Exception:
+        pass
+
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
+        handlers=handlers,
     )
+    logger.info("SharedInput tray app starting — log file: %s", log_file)
+
     app = TrayApp(config)
     app.run()

@@ -3,19 +3,38 @@
 The switcher sits between the capture layer and the network sender.
 When a switch hotkey is detected, it cycles through connected clients
 or returns to local mode.
+
+On macOS Tahoe+, pynput's keyboard.Listener crashes because it calls
+TSMGetInputSourceProperty from a background thread.  The switcher can
+operate in "event-fed" mode where it receives key events directly from
+the CGEventTap capture instead of running its own pynput listener.
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass
 from typing import Callable
-
-from pynput import keyboard
 
 from sharedinput.server.network import ClientInfo
 
 logger = logging.getLogger(__name__)
+
+# Virtual keycodes used for platform-independent hotkey matching.
+# On macOS these match CGEvent keycodes; on Windows/Linux they come
+# from pynput's Key enum.  The switcher normalises both to strings.
+_CTRL_NAMES = frozenset({"ctrl_l", "ctrl_r", "ctrl"})
+_ALT_NAMES = frozenset({"alt_l", "alt_r", "alt", "alt_gr"})
+_RIGHT_NAMES = frozenset({"right"})
+_LEFT_NAMES = frozenset({"left"})
+
+# macOS CGEvent keycodes for modifier / arrow keys
+_MACOS_KEYCODE_MAP: dict[int, str] = {
+    59: "ctrl_l", 62: "ctrl_r",
+    58: "alt_l", 61: "alt_r",
+    123: "left", 124: "right", 125: "down", 126: "up",
+}
 
 
 @dataclass
@@ -35,27 +54,22 @@ class HotkeySwitcher:
     Default hotkeys:
         Ctrl+Alt+Right → next client
         Ctrl+Alt+Left  → previous client / back to local
+
+    Two modes:
+        1. **pynput mode** (Windows / Linux): ``start()`` creates a
+           pynput keyboard.Listener on a background thread.
+        2. **event-fed mode** (macOS): call ``feed_key_press`` /
+           ``feed_key_release`` from the CGEventTap callback.
     """
 
     def __init__(
         self,
         on_switch: Callable[[str | None], None],
-        next_keys: frozenset | None = None,
-        prev_keys: frozenset | None = None,
     ) -> None:
         self._on_switch = on_switch
         self._state = SwitchState()
-        self._current_keys: set = set()
-
-        # Default hotkeys
-        self._next_keys = next_keys or frozenset({
-            keyboard.Key.ctrl_l, keyboard.Key.alt_l, keyboard.Key.right
-        })
-        self._prev_keys = prev_keys or frozenset({
-            keyboard.Key.ctrl_l, keyboard.Key.alt_l, keyboard.Key.left
-        })
-
-        self._listener: keyboard.Listener | None = None
+        self._current_keys: set[str] = set()  # normalised key names
+        self._listener = None  # pynput listener (non-macOS only)
 
     @property
     def active_client_id(self) -> str | None:
@@ -78,10 +92,21 @@ class HotkeySwitcher:
             self._switch_to(None)
 
     def start(self) -> None:
-        """Start listening for hotkeys."""
+        """Start listening for hotkeys via pynput (non-macOS only).
+
+        On macOS, hotkeys are detected via ``feed_key_press`` /
+        ``feed_key_release`` driven by the CGEventTap, so this is
+        a no-op.
+        """
+        if sys.platform == "darwin":
+            logger.info("Hotkey switcher started in event-fed mode (Ctrl+Alt+Arrow)")
+            return
+
+        from pynput import keyboard
+
         self._listener = keyboard.Listener(
-            on_press=self._on_press,
-            on_release=self._on_release,
+            on_press=self._on_pynput_press,
+            on_release=self._on_pynput_release,
         )
         self._listener.start()
         logger.info("Hotkey switcher started (Ctrl+Alt+Arrow to switch)")
@@ -91,22 +116,51 @@ class HotkeySwitcher:
         if self._listener:
             self._listener.stop()
 
-    def _on_press(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        if key is None:
-            return
-        self._current_keys.add(key)
-        self._check_hotkeys()
+    # -- event-fed API (macOS CGEventTap) ------------------------------------
 
-    def _on_release(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        if key is None:
-            return
-        self._current_keys.discard(key)
+    def feed_key_press(self, keycode: int) -> None:
+        """Feed a raw macOS keycode press into the hotkey detector."""
+        name = _MACOS_KEYCODE_MAP.get(keycode)
+        if name:
+            self._current_keys.add(name)
+            self._check_hotkeys()
+
+    def feed_key_release(self, keycode: int) -> None:
+        """Feed a raw macOS keycode release into the hotkey detector."""
+        name = _MACOS_KEYCODE_MAP.get(keycode)
+        if name:
+            self._current_keys.discard(name)
+
+    # -- pynput callbacks (Windows / Linux) ----------------------------------
+
+    def _on_pynput_press(self, key) -> None:
+        name = self._pynput_key_name(key)
+        if name:
+            self._current_keys.add(name)
+            self._check_hotkeys()
+
+    def _on_pynput_release(self, key) -> None:
+        name = self._pynput_key_name(key)
+        if name:
+            self._current_keys.discard(name)
+
+    @staticmethod
+    def _pynput_key_name(key) -> str | None:
+        from pynput import keyboard
+        if isinstance(key, keyboard.Key):
+            return key.name
+        return None
 
     def _check_hotkeys(self) -> None:
-        if self._next_keys.issubset(self._current_keys):
+        has_ctrl = bool(self._current_keys & _CTRL_NAMES)
+        has_alt = bool(self._current_keys & _ALT_NAMES)
+        has_right = bool(self._current_keys & _RIGHT_NAMES)
+        has_left = bool(self._current_keys & _LEFT_NAMES)
+
+        if has_ctrl and has_alt and has_right:
             self._switch_next()
             self._current_keys.clear()
-        elif self._prev_keys.issubset(self._current_keys):
+        elif has_ctrl and has_alt and has_left:
             self._switch_prev()
             self._current_keys.clear()
 
