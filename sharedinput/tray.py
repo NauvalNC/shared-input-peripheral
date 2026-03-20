@@ -60,7 +60,9 @@ class TrayApp:
         )
 
         # Snapshots for menu
-        self._connected_clients: list[tuple[str, str]] = []
+        self._connected_clients: list[tuple[str, str]] = []  # server-side
+        self._client_device_list: list[tuple[str | None, str]] = []  # client-side (id, hostname)
+        self._client_active_device_id: str | None = None  # client-side active device
 
         # Icons
         self._icon_default = create_default_icon(64)
@@ -111,15 +113,36 @@ class TrayApp:
         items.append(pystray.MenuItem("Quit", self._on_quit))
         return pystray.Menu(*items)
 
+    def _make_device_item(self, idx: int) -> pystray.MenuItem:
+        """Pre-allocated menu slot for a device in the client-side Switch Input."""
+        def on_click(icon, item):
+            if idx < len(self._client_device_list):
+                target_id = self._client_device_list[idx][0]  # may be None for server
+                self._on_client_switch_to(target_id)
+
+        return pystray.MenuItem(
+            lambda item, i=idx: (
+                self._client_device_list[i][1]
+                if i < len(self._client_device_list) else ""
+            ),
+            on_click,
+            checked=lambda item, i=idx: (
+                i < len(self._client_device_list)
+                and self._client_active_device_id == self._client_device_list[i][0]
+            ),
+            visible=lambda item, i=idx: i < len(self._client_device_list),
+        )
+
     def _build_idle_menu(self) -> list:
         items = []
         ip = _get_local_ip()
 
         # Show connection status
-        if self._client and self._client._control.is_connected:
+        is_connected = self._client and self._client._control.is_connected
+        if is_connected:
             server_name = self._client._control.server_hostname or "server"
             items.append(pystray.MenuItem(
-                f"Controlled by {server_name}", None, enabled=False
+                f"Connected to {server_name}", None, enabled=False
             ))
         else:
             items.append(pystray.MenuItem(
@@ -127,6 +150,20 @@ class TrayApp:
             ))
 
         items.append(pystray.Menu.SEPARATOR)
+
+        # Show Switch Input if this client has devices to switch to
+        if is_connected and len(self._client_device_list) > 1:
+            switch_items = []
+            for i in range(_MAX_DYNAMIC_ITEMS):
+                switch_items.append(self._make_device_item(i))
+            items.append(
+                pystray.MenuItem(
+                    "Switch Input",
+                    pystray.Menu(*switch_items),
+                )
+            )
+            items.append(pystray.Menu.SEPARATOR)
+
         items.append(pystray.MenuItem("Start as Server", self._on_start_server))
         return items
 
@@ -224,6 +261,17 @@ class TrayApp:
         else:
             self._connected_clients = []
 
+        # Client-side device list from server
+        if self._client and self._client._control.is_connected:
+            self._client_device_list = [
+                (d.get("id"), d.get("hostname", "unknown"))
+                for d in self._client._control.device_list
+            ]
+            self._client_active_device_id = self._client._control.active_device_id
+        else:
+            self._client_device_list = []
+            self._client_active_device_id = None
+
     # ── Actions ──────────────────────────────────────────────────────────
 
     def _on_start_server(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
@@ -238,6 +286,19 @@ class TrayApp:
     def _on_switch_to(self, client_id: str | None) -> None:
         if self._server:
             self._server.switch_to_client(client_id)
+
+    def _on_client_switch_to(self, target_id: str | None) -> None:
+        """Client-side: send SWITCH_REQUEST to server."""
+        if self._client and self._client._control.is_connected:
+            import asyncio
+            # Send async from main thread
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(self._client._control.send_switch_request(target_id))
+            except Exception:
+                logger.debug("Failed to send switch request", exc_info=True)
+            finally:
+                loop.close()
 
     def _on_disconnect(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         self._stop_server()

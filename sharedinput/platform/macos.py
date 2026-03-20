@@ -233,9 +233,8 @@ if _HAS_QUARTZ:
             self._callback = event_callback
             self._tap = None
             self._run_loop_source = None
-            self._last_mouse_x: float | None = None
-            self._last_mouse_y: float | None = None
             self._running = False
+            self._suppressing = False  # when True, block local input
 
         def install_tap(self) -> bool:
             """Create the CGEventTap and add it to the CURRENT thread's run loop.
@@ -245,7 +244,7 @@ if _HAS_QUARTZ:
             self._tap = Quartz.CGEventTapCreate(
                 Quartz.kCGSessionEventTap,
                 Quartz.kCGHeadInsertEventTap,
-                Quartz.kCGEventTapOptionListenOnly,
+                Quartz.kCGEventTapOptionDefault,  # can suppress events
                 _ALL_INPUT_EVENTS,
                 self._tap_callback,
                 None,
@@ -285,6 +284,11 @@ if _HAS_QUARTZ:
             self._run_loop_source = None
             logger.info("macOS CGEventTap removed")
 
+        def set_suppressing(self, suppressing: bool) -> None:
+            """Toggle input suppression. When True, local input is blocked."""
+            self._suppressing = suppressing
+            logger.info("Input suppression: %s", "ON" if suppressing else "OFF")
+
         def _tap_callback(self, proxy, event_type, cg_event, refcon):
             """CGEventTap callback — runs on the main thread."""
             if not self._running:
@@ -297,34 +301,35 @@ if _HAS_QUARTZ:
             except Exception:
                 logger.warning("Error in CGEventTap callback", exc_info=True)
 
+            # Suppress local input when forwarding to a client
+            if self._suppressing:
+                return None
             return cg_event
 
         def _translate(self, event_type: int, cg_event) -> InputEvent | None:
             ts = monotonic_ns()
 
-            # Mouse move / drag
+            # Mouse move / drag — use raw hardware deltas (not absolute position)
+            # This avoids the screen-edge boundary problem where absolute
+            # position stops changing but the user is still moving the mouse.
             if event_type in (
                 Quartz.kCGEventMouseMoved,
                 Quartz.kCGEventLeftMouseDragged,
                 Quartz.kCGEventRightMouseDragged,
                 Quartz.kCGEventOtherMouseDragged,
             ):
-                loc = Quartz.CGEventGetLocation(cg_event)
-                x, y = loc.x, loc.y
-                if self._last_mouse_x is not None:
-                    dx = int(x - self._last_mouse_x)
-                    dy = int(y - self._last_mouse_y)
-                    self._last_mouse_x = x
-                    self._last_mouse_y = y
-                    if dx != 0 or dy != 0:
-                        return MouseMoveEvent(
-                            dx=max(-32768, min(32767, dx)),
-                            dy=max(-32768, min(32767, dy)),
-                            timestamp=ts,
-                        )
-                else:
-                    self._last_mouse_x = x
-                    self._last_mouse_y = y
+                dx = Quartz.CGEventGetIntegerValueField(
+                    cg_event, Quartz.kCGMouseEventDeltaX
+                )
+                dy = Quartz.CGEventGetIntegerValueField(
+                    cg_event, Quartz.kCGMouseEventDeltaY
+                )
+                if dx != 0 or dy != 0:
+                    return MouseMoveEvent(
+                        dx=max(-32768, min(32767, int(dx))),
+                        dy=max(-32768, min(32767, int(dy))),
+                        timestamp=ts,
+                    )
                 return None
 
             # Mouse button press/release

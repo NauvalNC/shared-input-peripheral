@@ -83,6 +83,9 @@ class ClientControlServer:
         self._server_hostname: str = ""
         self._connected = False
         self._writer: asyncio.StreamWriter | None = None
+        # Device list from server (for Switch Input menu)
+        self._device_list: list[dict] = []  # [{"id": ..., "hostname": ...}, ...]
+        self._active_device_id: str | None = None  # which device has input now
 
     @property
     def server_hostname(self) -> str:
@@ -91,6 +94,22 @@ class ClientControlServer:
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    @property
+    def device_list(self) -> list[dict]:
+        return self._device_list
+
+    @property
+    def active_device_id(self) -> str | None:
+        return self._active_device_id
+
+    async def send_switch_request(self, target_id: str | None) -> None:
+        """Send a SWITCH_REQUEST to the server."""
+        if self._writer and not self._writer.is_closing():
+            msg = {"type": "SWITCH_REQUEST", "target_id": target_id}
+            self._writer.write(json.dumps(msg).encode() + b"\n")
+            await self._writer.drain()
+            logger.info("Sent SWITCH_REQUEST for target=%s", target_id)
 
     async def start(self) -> None:
         """Start TCP server, waiting for the server to connect to us."""
@@ -148,7 +167,7 @@ class ClientControlServer:
                 except (json.JSONDecodeError, UnicodeDecodeError) as e:
                     logger.warning("Invalid server message: %s", e)
 
-            # Listen for commands (SWITCH, etc.)
+            # Listen for commands (HEARTBEAT, DEVICE_LIST, etc.)
             while True:
                 try:
                     line = await reader.readline()
@@ -159,6 +178,9 @@ class ClientControlServer:
                     if msg_type == "HEARTBEAT":
                         writer.write(json.dumps({"type": "HEARTBEAT_ACK"}).encode() + b"\n")
                         await writer.drain()
+                    elif msg_type == "DEVICE_LIST":
+                        self._device_list = msg.get("devices", [])
+                        self._active_device_id = msg.get("active_id")
                 except (json.JSONDecodeError, UnicodeDecodeError, ConnectionResetError,
                         BrokenPipeError, OSError, asyncio.CancelledError):
                     break

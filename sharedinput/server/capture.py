@@ -70,6 +70,12 @@ def stop_macos_tap() -> None:
         _macos_capture = None
 
 
+def set_macos_tap_suppressing(suppressing: bool) -> None:
+    """Toggle input suppression on the macOS CGEventTap."""
+    if _macos_capture is not None:
+        _macos_capture.set_suppressing(suppressing)
+
+
 # ---------------------------------------------------------------------------
 # pynput-based capture (Windows / Linux / fallback)
 # ---------------------------------------------------------------------------
@@ -103,7 +109,12 @@ def _key_to_event_fields(key) -> tuple[int, str, str]:
 
 
 class InputCapture:
-    """Captures mouse and keyboard input using pynput (non-macOS)."""
+    """Captures mouse and keyboard input using pynput (non-macOS).
+
+    Supports toggling input suppression via ``set_suppressing()``.
+    When suppressing, listeners are restarted with ``suppress=True``
+    so that captured input is blocked from reaching the local system.
+    """
 
     def __init__(self, event_callback: Callable[[InputEvent], None]) -> None:
         self._callback = event_callback
@@ -112,33 +123,53 @@ class InputCapture:
         self._mouse_listener = None
         self._keyboard_listener = None
         self._running = False
+        self._suppressing = False
+
+    def set_suppressing(self, suppressing: bool) -> None:
+        """Toggle input suppression. Restarts listeners with new mode."""
+        if suppressing == self._suppressing:
+            return
+        self._suppressing = suppressing
+        logger.info("Input suppression: %s", "ON" if suppressing else "OFF")
+        if self._running:
+            self._stop_listeners()
+            self._start_listeners()
 
     def start(self) -> None:
         if self._running:
             return
+        self._running = True
+        self._start_listeners()
 
+    def _start_listeners(self) -> None:
         from pynput import keyboard, mouse
 
-        self._running = True
         self._mouse_listener = mouse.Listener(
             on_move=self._on_mouse_move,
             on_click=self._on_mouse_click,
             on_scroll=self._on_mouse_scroll,
+            suppress=self._suppressing,
         )
         self._keyboard_listener = keyboard.Listener(
             on_press=self._on_key_press,
             on_release=self._on_key_release,
+            suppress=self._suppressing,
         )
         self._mouse_listener.start()
         self._keyboard_listener.start()
         logger.info("Input capture started (pynput)")
 
-    def stop(self) -> None:
-        self._running = False
+    def _stop_listeners(self) -> None:
         if self._mouse_listener:
             self._mouse_listener.stop()
+            self._mouse_listener = None
         if self._keyboard_listener:
             self._keyboard_listener.stop()
+            self._keyboard_listener = None
+
+    def stop(self) -> None:
+        self._running = False
+        self._stop_listeners()
         logger.info("Input capture stopped")
 
     def _on_mouse_move(self, x: int, y: int) -> None:

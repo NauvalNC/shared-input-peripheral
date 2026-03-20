@@ -90,42 +90,51 @@ class InputInjector:
         - Multi-char name → Key enum lookup (e.g. "ctrl_l" → Key.ctrl_l)
         """
         name = event.key_name
+        if not name:
+            return None
 
         # Printable character (single char)
         if len(name) == 1:
             return KeyCode.from_char(name)
 
-        # Platform-independent key name → pynput Key enum
-        if name:
-            # Map common cross-platform names
-            name_map = {
-                "cmd": "cmd_l", "cmd_r": "cmd_r",
-                "shift": "shift_l",  # macOS sends "shift" for left shift
-                "enter": "enter",
-                "escape": "esc",
-                "backspace": "backspace",
-                "delete": "delete",
-                "caps_lock": "caps_lock",
-                "fn": "f1",  # fn key has no pynput equivalent; ignore
-                "num_lock": "num_lock",
-                "insert": "insert",
-            }
-            resolved_name = name_map.get(name, name)
+        # Map names that differ between macOS CGEventTap and pynput
+        _NAME_MAP = {
+            # macOS modifier names → pynput Key names
+            "ctrl_l": "ctrl_l", "ctrl_r": "ctrl_r",
+            "alt_l": "alt_l", "alt_r": "alt_r",
+            "shift": "shift", "shift_r": "shift_r",
+            "cmd": "cmd", "cmd_r": "cmd_r",
+            # Common aliases
+            "escape": "esc",
+            "caps_lock": "caps_lock",
+            "num_lock": "num_lock",
+            # These map directly in pynput
+            "enter": "enter",
+            "backspace": "backspace",
+            "delete": "delete",
+            "tab": "tab",
+            "space": "space",
+            "insert": "insert",
+            "home": "home", "end": "end",
+            "page_up": "page_up", "page_down": "page_down",
+            "left": "left", "right": "right", "up": "up", "down": "down",
+        }
 
+        resolved_name = _NAME_MAP.get(name, name)
+
+        # Direct lookup in Key enum
+        try:
+            return Key[resolved_name]
+        except KeyError:
+            pass
+
+        # Try stripping _l / _r suffix (e.g. "ctrl_l" → "ctrl")
+        if resolved_name.endswith("_l") or resolved_name.endswith("_r"):
+            base = resolved_name[:-2]
             try:
-                return Key[resolved_name]
+                return Key[base]
             except KeyError:
                 pass
 
-            # Try without _l/_r suffix
-            base = resolved_name.rstrip("_lr")
-            if base != resolved_name:
-                try:
-                    return Key[base]
-                except KeyError:
-                    pass
-
-        # Last resort: raw keycode (may not match across platforms)
-        if event.keycode:
-            return KeyCode.from_vk(event.keycode)
+        logger.debug("Unknown key name: %r (keycode=%d)", name, event.keycode)
         return None

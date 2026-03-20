@@ -13,6 +13,7 @@ import platform
 import socket
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 from sharedinput.protocol import InputEvent, serialize
 
@@ -70,9 +71,10 @@ class ClientConnector:
     Each connected device can receive forwarded input events.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, on_switch_request: Callable[[str | None], None] | None = None) -> None:
         self._clients: dict[str, ClientInfo] = {}
-        self._connecting: set[str] = set()  # device IDs currently being connected
+        self._connecting: set[str] = set()
+        self._on_switch_request = on_switch_request
 
     @property
     def clients(self) -> dict[str, ClientInfo]:
@@ -147,7 +149,9 @@ class ClientConnector:
     async def _heartbeat_loop(
         self, device_id: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        """Send periodic heartbeats to a connected client."""
+        """Send periodic heartbeats and listen for client messages."""
+        # Start reader task for SWITCH_REQUEST etc.
+        reader_task = asyncio.ensure_future(self._client_reader(device_id, reader))
         try:
             while device_id in self._clients and not writer.is_closing():
                 try:
@@ -159,7 +163,55 @@ class ClientConnector:
                         OSError, asyncio.CancelledError):
                     break
         finally:
+            reader_task.cancel()
             self._disconnect_client(device_id)
+
+    async def _client_reader(
+        self, device_id: str, reader: asyncio.StreamReader
+    ) -> None:
+        """Read messages from a client (e.g. SWITCH_REQUEST)."""
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                try:
+                    msg = json.loads(line.decode())
+                    msg_type = msg.get("type")
+                    if msg_type == "SWITCH_REQUEST" and self._on_switch_request:
+                        target_id = msg.get("target_id")  # None = server
+                        self._on_switch_request(target_id)
+                    elif msg_type == "HEARTBEAT_ACK":
+                        if device_id in self._clients:
+                            self._clients[device_id].last_heartbeat = time.monotonic()
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+        except (ConnectionResetError, BrokenPipeError, OSError, asyncio.CancelledError):
+            pass
+
+    async def broadcast_device_list(self, active_id: str | None, server_hostname: str) -> None:
+        """Send the current device list and active device to ALL clients."""
+        devices = [
+            {"id": None, "hostname": server_hostname},  # server is always first
+        ]
+        for cid, info in self._clients.items():
+            devices.append({"id": cid, "hostname": info.hostname})
+
+        msg = {
+            "type": "DEVICE_LIST",
+            "devices": devices,
+            "active_id": active_id,
+            "server_hostname": server_hostname,
+        }
+        data = json.dumps(msg).encode() + b"\n"
+
+        for client in list(self._clients.values()):
+            if client.writer and not client.writer.is_closing():
+                try:
+                    client.writer.write(data)
+                    await client.writer.drain()
+                except (OSError, ConnectionResetError):
+                    pass
 
     def _disconnect_client(self, device_id: str) -> None:
         """Remove a disconnected client."""

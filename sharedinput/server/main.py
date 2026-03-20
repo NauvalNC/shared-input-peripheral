@@ -17,7 +17,7 @@ from sharedinput.config import Config
 from sharedinput.discovery import DeviceBroadcaster, DeviceInfo, DeviceListener
 from sharedinput.platform import get_screen_resolution
 from sharedinput.protocol import MouseMoveEvent
-from sharedinput.server.capture import InputCapture, install_macos_tap, stop_macos_tap, use_macos_backend
+from sharedinput.server.capture import InputCapture, install_macos_tap, set_macos_tap_suppressing, stop_macos_tap, use_macos_backend
 from sharedinput.server.network import ClientConnector, UDPSender
 from sharedinput.server.switcher import HotkeySwitcher
 
@@ -30,7 +30,7 @@ class Server:
     def __init__(self, config: Config) -> None:
         self._config = config
         self._udp_sender = UDPSender(port=config.network.udp_port)
-        self._connector = ClientConnector()
+        self._connector = ClientConnector(on_switch_request=self._on_switch_request)
         self._switcher = HotkeySwitcher(on_switch=self._on_switch)
         self._broadcaster: DeviceBroadcaster | None = None  # set by tray
         self._listener: DeviceListener | None = None
@@ -86,6 +86,7 @@ class Server:
         if client_id is None:
             self._udp_sender.clear_target()
             self._forwarding = False
+            self._set_suppressing(False)
             logger.info("Now controlling: LOCAL")
         else:
             clients = self._connector.clients
@@ -93,7 +94,34 @@ class Server:
                 client = clients[client_id]
                 self._udp_sender.set_target(*client.address)
                 self._forwarding = True
+                self._set_suppressing(True)
                 logger.info("Now controlling: %s (%s)", client.hostname, client.address[0])
+        # Notify all clients about the switch
+        self._broadcast_device_list()
+
+    def _on_switch_request(self, target_id: str | None) -> None:
+        """Handle a SWITCH_REQUEST from a client."""
+        logger.info("Switch request from client: target=%s", target_id)
+        self.switch_to_client(target_id)
+
+    def _set_suppressing(self, suppressing: bool) -> None:
+        """Toggle input suppression on the capture layer."""
+        if self._macos_tap_installed:
+            set_macos_tap_suppressing(suppressing)
+        elif self._capture:
+            self._capture.set_suppressing(suppressing)
+
+    def _broadcast_device_list(self) -> None:
+        """Broadcast device list to all clients."""
+        import platform as platform_mod
+        if self._loop and self._connector:
+            asyncio.run_coroutine_threadsafe(
+                self._connector.broadcast_device_list(
+                    self._switcher.active_client_id,
+                    platform_mod.node(),
+                ),
+                self._loop,
+            )
 
     def _on_device_found(self, device: DeviceInfo) -> None:
         """Called when a new device is discovered — auto-connect to it."""
@@ -115,9 +143,15 @@ class Server:
         self._broadcaster = broadcaster
 
     async def _monitor_clients(self) -> None:
+        import platform as platform_mod
         while not self._shutdown_flag.is_set():
             self._switcher.update_clients(self._connector.clients)
-            await asyncio.sleep(1.0)
+            # Periodically broadcast device list to all clients
+            await self._connector.broadcast_device_list(
+                self._switcher.active_client_id,
+                platform_mod.node(),
+            )
+            await asyncio.sleep(2.0)
 
     async def run(self) -> None:
         """Run the server."""
