@@ -1,10 +1,9 @@
 """System tray UI — runs SharedInput as a menu bar / system tray app.
 
-Provides a tray icon with a menu to:
-- See connected devices
-- Switch active device
-- Start/stop server or client mode
-- Quit the app
+Menu structure:
+- Idle: Start as Server, Start as Client > (discovered servers), Quit
+- Server: status label, Switch Input > (devices), Disconnect, Quit
+- Client: status label, Disconnect, Quit
 """
 
 from __future__ import annotations
@@ -21,9 +20,13 @@ import pystray
 from PIL import Image
 
 from sharedinput.config import Config, load_config
+from sharedinput.discovery import DiscoveryListener
 from sharedinput.icons import create_active_icon, create_default_icon, create_disabled_icon
 
 logger = logging.getLogger(__name__)
+
+# Max slots for dynamic menu items (discovered servers / connected clients)
+_MAX_DYNAMIC_ITEMS = 10
 
 
 def _get_local_ip() -> str:
@@ -49,16 +52,31 @@ class TrayApp:
         self._client_thread: threading.Thread | None = None
         self._running_role: str | None = None  # "server" | "client" | None
 
+        # Discovery
+        self._discovery = DiscoveryListener(
+            discovery_port=self._config.network.discovery_port
+        )
+        # Snapshot of discovered servers / connected clients for menu
+        self._discovered_servers: list[tuple[str, str, str, int]] = []  # (id, hostname, ip, port)
+        self._connected_clients: list[tuple[str, str]] = []  # (client_id, hostname)
+
         # Icons
         self._icon_default = create_default_icon(64)
         self._icon_active = create_active_icon(64)
         self._icon_disabled = create_disabled_icon(64)
 
+        # Menu refresh timer
+        self._refresh_timer: threading.Timer | None = None
+
     def run(self) -> None:
         """Start the tray app (blocking)."""
+        # Start discovery listener to find servers
+        self._discovery.start()
+        self._start_refresh_timer()
+
         self._icon = pystray.Icon(
             name="SharedInput",
-            icon=self._icon_default,
+            icon=self._icon_disabled,
             title="SharedInput",
             menu=self._build_menu(),
         )
@@ -66,77 +84,173 @@ class TrayApp:
         self._icon.run(setup=self._on_setup)
 
     def _on_setup(self, icon: pystray.Icon) -> None:
-        """Called when the tray icon is ready."""
         icon.visible = True
-        icon.notify("SharedInput is running.\nRight-click the tray icon to get started.", "SharedInput")
-
-    def _build_menu(self) -> pystray.Menu:
-        """Build the tray context menu."""
-        return pystray.Menu(
-            pystray.MenuItem(
-                "SharedInput",
-                None,
-                enabled=False,
-            ),
-            pystray.Menu.SEPARATOR,
-            # Role section
-            pystray.MenuItem(
-                lambda item: self._role_label("server"),
-                self._on_start_server,
-                checked=lambda item: self._running_role == "server",
-                radio=True,
-            ),
-            pystray.MenuItem(
-                lambda item: self._role_label("client"),
-                self._on_start_client,
-                checked=lambda item: self._running_role == "client",
-                radio=True,
-            ),
-            pystray.MenuItem(
-                lambda item: "Stop" if self._running_role else "Stopped",
-                self._on_stop,
-                enabled=lambda item: self._running_role is not None,
-            ),
-            pystray.Menu.SEPARATOR,
-            # Status
-            pystray.MenuItem(
-                lambda item: self._status_text(),
-                None,
-                enabled=False,
-            ),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", self._on_quit),
+        icon.notify(
+            "SharedInput is running.\nRight-click the tray icon to get started.",
+            "SharedInput",
         )
 
-    def _role_label(self, role: str) -> str:
-        if role == "server":
-            ip = _get_local_ip()
-            if self._running_role == "server":
-                return f"Server (running on {ip})"
-            return f"Start as Server ({ip})"
-        else:
-            host = self._config.server_host or "not set"
-            if self._running_role == "client":
-                return f"Client (connected to {host})"
-            return f"Start as Client (→ {host})"
+    # ── Menu building ────────────────────────────────────────────────────
 
-    def _status_text(self) -> str:
-        if self._running_role == "server":
-            if self._server:
-                clients = self._server._control_server.clients
-                n = len(clients)
-                if n == 0:
-                    return "No clients connected"
-                names = [c.hostname for c in clients.values()]
-                active_id = self._server._switcher.active_client_id
-                if active_id and active_id in clients:
-                    active_name = clients[active_id].hostname
-                    return f"Controlling: {active_name} ({n} connected)"
-                return f"Local mode ({n} client{'s' if n > 1 else ''} connected)"
-            return "Server starting..."
+    def _build_menu(self) -> pystray.Menu:
+        """Build the complete tray menu based on current state."""
+        items: list[pystray.MenuItem] = []
+
+        # Title
+        items.append(pystray.MenuItem("SharedInput", None, enabled=False))
+
+        if self._running_role is None:
+            items.extend(self._build_idle_menu())
+        elif self._running_role == "server":
+            items.extend(self._build_server_menu())
         elif self._running_role == "client":
-            return "Waiting for server to switch to this device..."
-        return "Not running — choose a role above"
+            items.extend(self._build_client_menu())
+
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem("Quit", self._on_quit))
+
+        return pystray.Menu(*items)
+
+    def _build_idle_menu(self) -> list:
+        """Menu items when idle (not server or client)."""
+        items = []
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem("Start as Server", self._on_start_server))
+
+        # "Start as Client" submenu with discovered servers
+        server_items = []
+        servers = self._discovered_servers
+        if not servers:
+            server_items.append(
+                pystray.MenuItem("Scanning...", None, enabled=False)
+            )
+        else:
+            for sid, hostname, ip, port in servers:
+                label = f"{hostname} ({ip})"
+                # Use default args to capture loop variables
+                action = lambda icon, item, _ip=ip, _port=port: self._on_connect_to_server(_ip, _port)
+                server_items.append(pystray.MenuItem(label, action))
+
+        items.append(
+            pystray.MenuItem(
+                "Start as Client",
+                pystray.Menu(*server_items),
+            )
+        )
+        return items
+
+    def _build_server_menu(self) -> list:
+        """Menu items when running as server."""
+        items = []
+        ip = _get_local_ip()
+        items.append(pystray.MenuItem(f"Server on {ip}", None, enabled=False))
+        items.append(pystray.Menu.SEPARATOR)
+
+        # "Switch Input" submenu — only if clients connected
+        clients = self._connected_clients
+        if clients:
+            switch_items = []
+
+            # "This Computer (Server)" — checked when no client is active
+            active_id = None
+            if self._server:
+                active_id = self._server._switcher.active_client_id
+
+            switch_items.append(
+                pystray.MenuItem(
+                    "This Computer (Server)",
+                    lambda icon, item: self._on_switch_to(None),
+                    checked=lambda item: (
+                        self._server is not None
+                        and self._server._switcher.active_client_id is None
+                    ),
+                )
+            )
+
+            for cid, hostname in clients:
+                switch_items.append(
+                    pystray.MenuItem(
+                        hostname,
+                        lambda icon, item, _cid=cid: self._on_switch_to(_cid),
+                        checked=lambda item, _cid=cid: (
+                            self._server is not None
+                            and self._server._switcher.active_client_id == _cid
+                        ),
+                    )
+                )
+
+            items.append(
+                pystray.MenuItem("Switch Input", pystray.Menu(*switch_items))
+            )
+        else:
+            items.append(
+                pystray.MenuItem("No clients connected", None, enabled=False)
+            )
+
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem("Disconnect", self._on_disconnect))
+        return items
+
+    def _build_client_menu(self) -> list:
+        """Menu items when running as client."""
+        items = []
+        server_name = ""
+        if self._client and hasattr(self._client, '_control') and self._client._control:
+            server_name = self._client._control.server_hostname
+        if not server_name:
+            server_name = self._config.server_host
+        items.append(
+            pystray.MenuItem(f"Connected to {server_name}", None, enabled=False)
+        )
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem("Disconnect", self._on_disconnect))
+        return items
+
+    # ── Menu refresh ─────────────────────────────────────────────────────
+
+    def _start_refresh_timer(self) -> None:
+        """Start periodic menu refresh (every 2 seconds)."""
+        self._stop_refresh_timer()
+        self._refresh_timer = threading.Timer(2.0, self._on_refresh_tick)
+        self._refresh_timer.daemon = True
+        self._refresh_timer.start()
+
+    def _stop_refresh_timer(self) -> None:
+        if self._refresh_timer:
+            self._refresh_timer.cancel()
+            self._refresh_timer = None
+
+    def _on_refresh_tick(self) -> None:
+        """Refresh menu data and schedule next tick."""
+        self._update_snapshots()
+        if self._icon:
+            self._icon.menu = self._build_menu()
+        self._update_icon_state()
+        # Schedule next refresh
+        self._start_refresh_timer()
+
+    def _update_snapshots(self) -> None:
+        """Update cached snapshots of servers/clients for menu building."""
+        # Discovered servers (when idle)
+        if self._running_role is None:
+            servers = self._discovery.servers
+            self._discovered_servers = [
+                (s.server_id, s.hostname, s.ip, s.tcp_port)
+                for s in servers.values()
+            ]
+        else:
+            self._discovered_servers = []
+
+        # Connected clients (when server)
+        if self._running_role == "server" and self._server:
+            clients = self._server._control_server.clients
+            self._connected_clients = [
+                (cid, info.hostname) for cid, info in clients.items()
+            ]
+        else:
+            self._connected_clients = []
+
+    # ── Actions ──────────────────────────────────────────────────────────
 
     def _on_start_server(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         if self._running_role == "server":
@@ -144,30 +258,37 @@ class TrayApp:
         self._stop_current()
         self._start_server()
 
-    def _on_start_client(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
-        if self._running_role == "client":
+    def _on_connect_to_server(self, ip: str, tcp_port: int) -> None:
+        """Connect to a discovered server."""
+        if self._running_role is not None:
             return
-
-        if not self._config.server_host:
-            icon.notify(
-                "Server host not configured.\n"
-                "Set server_host in sharedinput.toml\n"
-                "or run from CLI: sharedinput client --host <IP>",
-                "SharedInput — Error",
-            )
-            return
-
+        self._config.server_host = ip
+        self._config.network.tcp_port = tcp_port
         self._stop_current()
         self._start_client()
 
-    def _on_stop(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+    def _on_switch_to(self, client_id: str | None) -> None:
+        """Switch input to a specific client or back to server."""
+        if self._server:
+            self._server.switch_to_client(client_id)
+
+    def _on_disconnect(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         self._stop_current()
+        # Restart discovery
+        self._discovery.start()
+        self._update_snapshots()
+        if self._icon:
+            self._icon.menu = self._build_menu()
         self._update_icon_state()
 
     def _on_quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        self._stop_refresh_timer()
         self._stop_current()
+        self._discovery.stop()
         if self._icon:
             self._icon.stop()
+
+    # ── Server / Client lifecycle ────────────────────────────────────────
 
     def _start_server(self) -> None:
         from sharedinput.server.main import Server
@@ -185,13 +306,14 @@ class TrayApp:
                     )
                 return
 
+        # Stop discovery — we're the server now
+        self._discovery.stop()
+
         self._config.role = "server"
         self._server = Server(self._config)
         self._running_role = "server"
 
-        # On macOS, install the CGEventTap on the main thread (we ARE on
-        # the main thread here — pystray menu callbacks run on it).
-        # The tap hooks into pystray's NSApplication run loop.
+        # On macOS, install the CGEventTap on the main thread
         self._server.install_capture_on_main_thread()
 
         def run():
@@ -207,12 +329,17 @@ class TrayApp:
         self._server_thread = threading.Thread(target=run, daemon=True)
         self._server_thread.start()
         self._update_icon_state()
-        logger.info("Server started in background")
+        self._update_snapshots()
         if self._icon:
+            self._icon.menu = self._build_menu()
             self._icon.notify("Server started.\nWaiting for clients...", "SharedInput")
+        logger.info("Server started in background")
 
     def _start_client(self) -> None:
         from sharedinput.client.main import Client
+
+        # Stop discovery — we're connecting
+        self._discovery.stop()
 
         self._config.role = "client"
         self._client = Client(self._config)
@@ -231,12 +358,13 @@ class TrayApp:
         self._client_thread = threading.Thread(target=run, daemon=True)
         self._client_thread.start()
         self._update_icon_state()
-        logger.info("Client started in background")
         if self._icon:
+            self._icon.menu = self._build_menu()
             self._icon.notify(
-                f"Connected to {self._config.server_host}.\nWaiting for input...",
+                f"Connecting to {self._config.server_host}...",
                 "SharedInput",
             )
+        logger.info("Client started in background")
 
     def _stop_current(self) -> None:
         if self._server:
@@ -246,12 +374,12 @@ class TrayApp:
             self._client.shutdown()
             self._client = None
         self._running_role = None
+        self._connected_clients = []
         self._update_icon_state()
 
     def _update_icon_state(self) -> None:
         if not self._icon:
             return
-
         if self._running_role is None:
             self._icon.icon = self._icon_disabled
         elif self._running_role == "server" and self._server and self._server._forwarding:

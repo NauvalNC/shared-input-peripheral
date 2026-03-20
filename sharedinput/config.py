@@ -31,6 +31,7 @@ class HotkeyConfig:
 class NetworkConfig:
     udp_port: int = 9876
     tcp_port: int = 9877
+    discovery_port: int = 9878
     encryption: bool = True
 
 
@@ -99,6 +100,7 @@ def load_config(path: str | Path | None = None) -> Config:
     network = data.get("network", {})
     config.network.udp_port = network.get("udp_port", config.network.udp_port)
     config.network.tcp_port = network.get("tcp_port", config.network.tcp_port)
+    config.network.discovery_port = network.get("discovery_port", config.network.discovery_port)
     config.network.encryption = network.get("encryption", config.network.encryption)
 
     # Devices

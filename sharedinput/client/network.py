@@ -81,6 +81,7 @@ class ControlClient:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._active = False
+        self._server_hostname: str = ""
 
     @property
     def is_active(self) -> bool:
@@ -89,6 +90,10 @@ class ControlClient:
     @property
     def client_id(self) -> str:
         return self._client_id
+
+    @property
+    def server_hostname(self) -> str:
+        return self._server_hostname
 
     async def connect(self) -> None:
         """Connect to the server control plane."""
@@ -114,6 +119,7 @@ class ControlClient:
             try:
                 response = json.loads(line.decode())
                 logger.info("Registration response: %s", response)
+                self._server_hostname = response.get("server_hostname", "")
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 logger.warning("Invalid registration response: %s", e)
 

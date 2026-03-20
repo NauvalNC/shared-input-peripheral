@@ -145,9 +145,14 @@ class ControlServer:
                 platform=platform,
                 address=(peer[0], udp_port),
             )
+            import platform as platform_mod
             logger.info("Client registered: %s (%s) at %s:%d", hostname, platform, peer[0], udp_port)
             self._on_client_connected.set()
-            return {"type": "REGISTERED", "status": "ok"}
+            return {
+                "type": "REGISTERED",
+                "status": "ok",
+                "server_hostname": platform_mod.node(),
+            }
 
         elif msg_type == "HEARTBEAT":
             client_id = msg.get("client_id", "")

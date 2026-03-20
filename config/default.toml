@@ -18,6 +18,9 @@ back_to_local = "ctrl+alt+home"
 udp_port = 9876
 tcp_port = 9877
 
+# Port for LAN server discovery (UDP broadcast)
+discovery_port = 9878
+
 # Encrypt input events over the network
 encryption = true
 

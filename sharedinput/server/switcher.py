@@ -202,6 +202,17 @@ class HotkeySwitcher:
             else:
                 self._switch_to(order[prev_idx])
 
+    def switch_to(self, client_id: str | None) -> None:
+        """Public API: switch to a specific client or local mode.
+
+        Args:
+            client_id: The client ID to switch to, or None for local/server.
+        """
+        if client_id is not None and client_id not in self._state.client_order:
+            logger.warning("Cannot switch to unknown client: %s", client_id)
+            return
+        self._switch_to(client_id)
+
     def _switch_to(self, client_id: str | None) -> None:
         """Switch to a specific client or local mode."""
         self._state.active_client_id = client_id

@@ -10,6 +10,7 @@ import sys
 import threading
 
 from sharedinput.config import Config
+from sharedinput.discovery import DiscoveryBroadcaster
 from sharedinput.server.capture import InputCapture, install_macos_tap, stop_macos_tap, use_macos_backend
 from sharedinput.server.network import ControlServer, UDPSender
 from sharedinput.server.switcher import HotkeySwitcher
@@ -25,9 +26,12 @@ class Server:
         self._udp_sender = UDPSender(port=config.network.udp_port)
         self._control_server = ControlServer(port=config.network.tcp_port)
         self._switcher = HotkeySwitcher(on_switch=self._on_switch)
+        self._broadcaster = DiscoveryBroadcaster(
+            tcp_port=config.network.tcp_port,
+            discovery_port=config.network.discovery_port,
+        )
         self._capture: InputCapture | None = None
         self._forwarding = False
-        self._shutdown_event: asyncio.Event | None = None  # created in run()
         self._shutdown_flag = threading.Event()  # thread-safe for shutdown()
         self._macos_tap_installed = False
 
@@ -94,6 +98,9 @@ class Server:
         # Start control server
         await self._control_server.start()
 
+        # Start discovery broadcaster
+        self._broadcaster.start()
+
         # Start hotkey switcher
         self._switcher.start()
 
@@ -121,7 +128,15 @@ class Server:
         finally:
             self._cleanup()
 
+    def switch_to_client(self, client_id: str | None) -> None:
+        """Programmatically switch input to a client (or None for local).
+
+        Used by the tray menu's "Switch Input" submenu.
+        """
+        self._switcher.switch_to(client_id)
+
     def _cleanup(self) -> None:
+        self._broadcaster.stop()
         if self._capture:
             self._capture.stop()
         if self._macos_tap_installed:
