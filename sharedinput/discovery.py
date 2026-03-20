@@ -38,6 +38,17 @@ def _get_local_ip() -> str:
         return "127.0.0.1"
 
 
+def _get_subnet_broadcast(local_ip: str) -> str | None:
+    """Derive the subnet broadcast address (assumes /24 subnet)."""
+    try:
+        parts = local_ip.split(".")
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+    except Exception:
+        pass
+    return None
+
+
 @dataclass
 class ServerInfo:
     """A discovered server on the LAN."""
@@ -99,12 +110,20 @@ class DiscoveryBroadcaster:
             "version": 1,
         }).encode()
 
+        # Build list of broadcast targets
+        targets = [("255.255.255.255", self._discovery_port)]
+        # Also try subnet broadcast (e.g., 192.168.1.255)
+        subnet_broadcast = _get_subnet_broadcast(local_ip)
+        if subnet_broadcast and subnet_broadcast != "255.255.255.255":
+            targets.append((subnet_broadcast, self._discovery_port))
+
         try:
             while self._running:
-                try:
-                    sock.sendto(payload, ("255.255.255.255", self._discovery_port))
-                except OSError as e:
-                    logger.debug("Broadcast send error: %s", e)
+                for target in targets:
+                    try:
+                        sock.sendto(payload, target)
+                    except OSError as e:
+                        logger.debug("Broadcast send error to %s: %s", target, e)
                 time.sleep(_BROADCAST_INTERVAL)
         finally:
             sock.close()
@@ -192,11 +211,6 @@ class DiscoveryListener:
         hostname = msg.get("hostname", "unknown")
         ip = msg.get("ip", addr[0])
         tcp_port = msg.get("tcp_port", 9877)
-
-        # Ignore our own broadcasts
-        local_ip = _get_local_ip()
-        if ip == local_ip:
-            return
 
         with self._lock:
             self._servers[server_id] = ServerInfo(
