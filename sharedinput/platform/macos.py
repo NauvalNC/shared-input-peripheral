@@ -146,17 +146,41 @@ _CG_KEYCODE_TO_NAME: dict[int, str] = {
 }
 
 
+# macOS keycode → unmodified base character (US keyboard layout)
+# Used when modifiers are held and CGEventKeyboardGetUnicodeString
+# returns control characters instead of the actual key
+_CG_KEYCODE_TO_CHAR: dict[int, str] = {
+    0: "a", 1: "s", 2: "d", 3: "f", 4: "h", 5: "g", 6: "z", 7: "x",
+    8: "c", 9: "v", 11: "b", 12: "q", 13: "w", 14: "e", 15: "r",
+    16: "y", 17: "t", 18: "1", 19: "2", 20: "3", 21: "4", 22: "6",
+    23: "5", 24: "=", 25: "9", 26: "7", 27: "-", 28: "8", 29: "0",
+    30: "]", 31: "o", 32: "u", 33: "[", 34: "i", 35: "p", 37: "l",
+    38: "j", 39: "'", 40: "k", 41: ";", 42: "\\", 43: ",", 44: "/",
+    45: "n", 46: "m", 47: ".",  50: "`",
+}
+
+
 def _cg_keycode_to_key_name(keycode: int, char: str) -> str:
     """Convert a CGEvent keycode + character to a platform-independent key name.
 
     Returns the character for printable keys, or a name like "ctrl_l" for
-    special/modifier keys.
+    special/modifier keys. Falls back to the unmodified base character
+    when modifiers produce control characters.
     """
     # Check special key map first
     name = _CG_KEYCODE_TO_NAME.get(keycode)
     if name:
         return name
-    # Fall back to the printable character
+
+    # If char is a printable character, use it
+    if char and len(char) == 1 and char.isprintable():
+        return char
+
+    # Fall back to base character from keycode (when modifiers alter the char)
+    base = _CG_KEYCODE_TO_CHAR.get(keycode)
+    if base:
+        return base
+
     return char
 
 
@@ -287,6 +311,10 @@ if _HAS_QUARTZ:
         def set_suppressing(self, suppressing: bool) -> None:
             """Toggle input suppression. When True, local input is blocked."""
             self._suppressing = suppressing
+            # Disconnect/reconnect hardware mouse from cursor position
+            # Without this, the cursor still tracks physical mouse movement
+            # even though events are suppressed
+            Quartz.CGAssociateMouseAndMouseCursorPosition(not suppressing)
             logger.info("Input suppression: %s", "ON" if suppressing else "OFF")
 
         def _tap_callback(self, proxy, event_type, cg_event, refcon):

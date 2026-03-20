@@ -102,7 +102,6 @@ class TrayApp:
 
     def _build_menu(self) -> pystray.Menu:
         items: list[pystray.MenuItem] = []
-        items.append(pystray.MenuItem("SharedInput", None, enabled=False))
 
         if self._running_role is None or self._running_role == "passive_client":
             items.extend(self._build_idle_menu())
@@ -133,38 +132,47 @@ class TrayApp:
             visible=lambda item, i=idx: i < len(self._client_device_list),
         )
 
+    @property
+    def _is_client_connected(self) -> bool:
+        return bool(self._client and self._client._control.is_connected)
+
     def _build_idle_menu(self) -> list:
         items = []
         ip = _get_local_ip()
 
-        # Show connection status
-        is_connected = self._client and self._client._control.is_connected
-        if is_connected:
-            server_name = self._client._control.server_hostname or "server"
-            items.append(pystray.MenuItem(
-                f"Connected to {server_name}", None, enabled=False
-            ))
-        else:
-            items.append(pystray.MenuItem(
-                f"Ready on {ip}", None, enabled=False
-            ))
+        # "Connected to [server]" — visible only when connected
+        items.append(pystray.MenuItem(
+            lambda item: (
+                f"Connected to {self._client._control.server_hostname or 'server'}"
+                if self._is_client_connected else f"Ready on {ip}"
+            ),
+            None,
+            enabled=False,
+        ))
 
         items.append(pystray.Menu.SEPARATOR)
 
-        # Show Switch Input if this client has devices to switch to
-        if is_connected and len(self._client_device_list) > 1:
-            switch_items = []
-            for i in range(_MAX_DYNAMIC_ITEMS):
-                switch_items.append(self._make_device_item(i))
-            items.append(
-                pystray.MenuItem(
-                    "Switch Input",
-                    pystray.Menu(*switch_items),
-                )
+        # Switch Input — visible only when connected AND has devices
+        switch_items = []
+        for i in range(_MAX_DYNAMIC_ITEMS):
+            switch_items.append(self._make_device_item(i))
+        items.append(
+            pystray.MenuItem(
+                "Switch Input",
+                pystray.Menu(*switch_items),
+                visible=lambda item: (
+                    self._is_client_connected
+                    and len(self._client_device_list) > 1
+                ),
             )
-            items.append(pystray.Menu.SEPARATOR)
+        )
 
-        items.append(pystray.MenuItem("Start as Server", self._on_start_server))
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem(
+            "Start as Server",
+            self._on_start_server,
+            visible=lambda item: not self._is_client_connected,
+        ))
         return items
 
     def _make_client_item(self, idx: int) -> pystray.MenuItem:

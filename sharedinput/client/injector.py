@@ -1,12 +1,14 @@
 """Input injection — replays input events on the client machine.
 
 Uses pynput controllers to inject mouse and keyboard events received
-from the server.
+from the server.  On macOS, uses Quartz CGEvent API directly for
+mouse injection to avoid snap-back issues with pynput.
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 
 from pynput import keyboard, mouse
 from pynput.keyboard import Key, KeyCode
@@ -30,6 +32,15 @@ _BUTTON_MAP = {
     MouseButton.MIDDLE: mouse.Button.middle,
 }
 
+# macOS Quartz imports for direct mouse control
+_HAS_QUARTZ = False
+if sys.platform == "darwin":
+    try:
+        import Quartz
+        _HAS_QUARTZ = True
+    except ImportError:
+        pass
+
 
 class InputInjector:
     """Injects input events into the local system."""
@@ -37,6 +48,14 @@ class InputInjector:
     def __init__(self) -> None:
         self._mouse = mouse.Controller()
         self._keyboard = keyboard.Controller()
+        self._mac_mouse_x: float = 0.0
+        self._mac_mouse_y: float = 0.0
+        if _HAS_QUARTZ:
+            # Initialize to current cursor position
+            pos = Quartz.NSEvent.mouseLocation()
+            screen_h = Quartz.CGDisplayPixelsHigh(Quartz.CGMainDisplayID())
+            self._mac_mouse_x = pos.x
+            self._mac_mouse_y = screen_h - pos.y  # flip Y (Quartz uses top-left)
 
     def inject(self, event: InputEvent) -> None:
         """Inject a single input event."""
@@ -54,14 +73,43 @@ class InputInjector:
             logger.warning("Unknown event type: %s", type(event))
 
     def _inject_mouse_move(self, event: MouseMoveEvent) -> None:
-        self._mouse.move(event.dx, event.dy)
+        if _HAS_QUARTZ:
+            # Use Quartz directly to avoid snap-back issues on macOS
+            self._mac_mouse_x += event.dx
+            self._mac_mouse_y += event.dy
+            # Clamp to screen bounds
+            screen_w = Quartz.CGDisplayPixelsWide(Quartz.CGMainDisplayID())
+            screen_h = Quartz.CGDisplayPixelsHigh(Quartz.CGMainDisplayID())
+            self._mac_mouse_x = max(0, min(screen_w - 1, self._mac_mouse_x))
+            self._mac_mouse_y = max(0, min(screen_h - 1, self._mac_mouse_y))
+            point = Quartz.CGPointMake(self._mac_mouse_x, self._mac_mouse_y)
+            move_event = Quartz.CGEventCreateMouseEvent(
+                None, Quartz.kCGEventMouseMoved, point, Quartz.kCGMouseButtonLeft
+            )
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, move_event)
+        else:
+            self._mouse.move(event.dx, event.dy)
 
     def _inject_mouse_click(self, event: MouseClickEvent) -> None:
-        button = _BUTTON_MAP.get(event.button, mouse.Button.left)
-        if event.pressed:
-            self._mouse.press(button)
+        if _HAS_QUARTZ:
+            point = Quartz.CGPointMake(self._mac_mouse_x, self._mac_mouse_y)
+            if event.button == MouseButton.LEFT:
+                etype = Quartz.kCGEventLeftMouseDown if event.pressed else Quartz.kCGEventLeftMouseUp
+                btn = Quartz.kCGMouseButtonLeft
+            elif event.button == MouseButton.RIGHT:
+                etype = Quartz.kCGEventRightMouseDown if event.pressed else Quartz.kCGEventRightMouseUp
+                btn = Quartz.kCGMouseButtonRight
+            else:
+                etype = Quartz.kCGEventOtherMouseDown if event.pressed else Quartz.kCGEventOtherMouseUp
+                btn = Quartz.kCGMouseButtonCenter
+            click_event = Quartz.CGEventCreateMouseEvent(None, etype, point, btn)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, click_event)
         else:
-            self._mouse.release(button)
+            button = _BUTTON_MAP.get(event.button, mouse.Button.left)
+            if event.pressed:
+                self._mouse.press(button)
+            else:
+                self._mouse.release(button)
 
     def _inject_mouse_scroll(self, event: MouseScrollEvent) -> None:
         self._mouse.scroll(event.dx, event.dy)
