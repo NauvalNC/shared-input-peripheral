@@ -111,25 +111,39 @@ class TrayApp:
 
         return pystray.Menu(*items)
 
+    def _make_server_item(self, idx: int) -> pystray.MenuItem:
+        """Create a pre-allocated menu item slot for a discovered server."""
+        def on_click(icon, item):
+            if idx < len(self._discovered_servers):
+                _, _, ip, port = self._discovered_servers[idx]
+                self._on_connect_to_server(ip, port)
+
+        return pystray.MenuItem(
+            lambda item, i=idx: (
+                f"{self._discovered_servers[i][1]} ({self._discovered_servers[i][2]})"
+                if i < len(self._discovered_servers) else ""
+            ),
+            on_click,
+            visible=lambda item, i=idx: i < len(self._discovered_servers),
+        )
+
     def _build_idle_menu(self) -> list:
         """Menu items when idle (not server or client)."""
         items = []
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("Start as Server", self._on_start_server))
 
-        # "Start as Client" submenu with discovered servers
-        server_items = []
-        servers = self._discovered_servers
-        if not servers:
-            server_items.append(
-                pystray.MenuItem("Scanning...", None, enabled=False)
-            )
-        else:
-            for sid, hostname, ip, port in servers:
-                label = f"{hostname} ({ip})"
-                # Use default args to capture loop variables
-                action = lambda icon, item, _ip=ip, _port=port: self._on_connect_to_server(_ip, _port)
-                server_items.append(pystray.MenuItem(label, action))
+        # "Start as Client" submenu with pre-allocated slots
+        server_items = [
+            pystray.MenuItem(
+                "Scanning...",
+                None,
+                enabled=False,
+                visible=lambda item: len(self._discovered_servers) == 0,
+            ),
+        ]
+        for i in range(_MAX_DYNAMIC_ITEMS):
+            server_items.append(self._make_server_item(i))
 
         items.append(
             pystray.MenuItem(
@@ -139,6 +153,27 @@ class TrayApp:
         )
         return items
 
+    def _make_client_item(self, idx: int) -> pystray.MenuItem:
+        """Create a pre-allocated menu item slot for a connected client."""
+        def on_click(icon, item):
+            if idx < len(self._connected_clients):
+                cid = self._connected_clients[idx][0]
+                self._on_switch_to(cid)
+
+        return pystray.MenuItem(
+            lambda item, i=idx: (
+                self._connected_clients[i][1]
+                if i < len(self._connected_clients) else ""
+            ),
+            on_click,
+            checked=lambda item, i=idx: (
+                self._server is not None
+                and i < len(self._connected_clients)
+                and self._server._switcher.active_client_id == self._connected_clients[i][0]
+            ),
+            visible=lambda item, i=idx: i < len(self._connected_clients),
+        )
+
     def _build_server_menu(self) -> list:
         """Menu items when running as server."""
         items = []
@@ -146,46 +181,37 @@ class TrayApp:
         items.append(pystray.MenuItem(f"Server on {ip}", None, enabled=False))
         items.append(pystray.Menu.SEPARATOR)
 
-        # "Switch Input" submenu — only if clients connected
-        clients = self._connected_clients
-        if clients:
-            switch_items = []
+        # "Switch Input" submenu with pre-allocated slots
+        switch_items = [
+            pystray.MenuItem(
+                "This Computer (Server)",
+                self._on_switch_to_local,
+                checked=lambda item: (
+                    self._server is not None
+                    and self._server._switcher.active_client_id is None
+                ),
+            ),
+        ]
+        for i in range(_MAX_DYNAMIC_ITEMS):
+            switch_items.append(self._make_client_item(i))
 
-            # "This Computer (Server)" — checked when no client is active
-            active_id = None
-            if self._server:
-                active_id = self._server._switcher.active_client_id
-
-            switch_items.append(
-                pystray.MenuItem(
-                    "This Computer (Server)",
-                    lambda icon, item: self._on_switch_to(None),
-                    checked=lambda item: (
-                        self._server is not None
-                        and self._server._switcher.active_client_id is None
-                    ),
-                )
+        items.append(
+            pystray.MenuItem(
+                "Switch Input",
+                pystray.Menu(*switch_items),
+                visible=lambda item: len(self._connected_clients) > 0,
             )
+        )
 
-            for cid, hostname in clients:
-                switch_items.append(
-                    pystray.MenuItem(
-                        hostname,
-                        lambda icon, item, _cid=cid: self._on_switch_to(_cid),
-                        checked=lambda item, _cid=cid: (
-                            self._server is not None
-                            and self._server._switcher.active_client_id == _cid
-                        ),
-                    )
-                )
-
-            items.append(
-                pystray.MenuItem("Switch Input", pystray.Menu(*switch_items))
+        # "No clients connected" — only when no clients
+        items.append(
+            pystray.MenuItem(
+                "No clients connected",
+                None,
+                enabled=False,
+                visible=lambda item: len(self._connected_clients) == 0,
             )
-        else:
-            items.append(
-                pystray.MenuItem("No clients connected", None, enabled=False)
-            )
+        )
 
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("Disconnect", self._on_disconnect))
@@ -224,7 +250,13 @@ class TrayApp:
         """Refresh menu data and schedule next tick."""
         self._update_snapshots()
         if self._icon:
-            self._icon.menu = self._build_menu()
+            try:
+                self._icon.menu = self._build_menu()
+                # Force menu update on backends that support it
+                if hasattr(self._icon, 'update_menu'):
+                    self._icon.update_menu()
+            except Exception:
+                logger.debug("Menu refresh error", exc_info=True)
         self._update_icon_state()
         # Schedule next refresh
         self._start_refresh_timer()
@@ -266,6 +298,10 @@ class TrayApp:
         self._config.network.tcp_port = tcp_port
         self._stop_current()
         self._start_client()
+
+    def _on_switch_to_local(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        """Switch input back to the server (local)."""
+        self._on_switch_to(None)
 
     def _on_switch_to(self, client_id: str | None) -> None:
         """Switch input to a specific client or back to server."""
