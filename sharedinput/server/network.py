@@ -29,6 +29,8 @@ class ClientInfo:
     hostname: str
     platform: str
     address: tuple[str, int]  # (ip, udp_port)
+    screen_width: int = 1920
+    screen_height: int = 1080
     last_heartbeat: float = field(default_factory=time.monotonic)
 
 
@@ -139,11 +141,16 @@ class ControlServer:
             platform = msg.get("platform", "unknown")
             udp_port = msg.get("udp_port", DEFAULT_UDP_PORT)
 
+            screen_width = msg.get("screen_width", 1920)
+            screen_height = msg.get("screen_height", 1080)
+
             self._clients[client_id] = ClientInfo(
                 client_id=client_id,
                 hostname=hostname,
                 platform=platform,
                 address=(peer[0], udp_port),
+                screen_width=screen_width,
+                screen_height=screen_height,
             )
             import platform as platform_mod
             logger.info("Client registered: %s (%s) at %s:%d", hostname, platform, peer[0], udp_port)

@@ -102,6 +102,10 @@ class ControlClient:
         )
         logger.info("Connected to control server at %s:%d", self._server_host, self._server_port)
 
+        # Get screen resolution to send to server for mouse scaling
+        from sharedinput.platform import get_screen_resolution
+        screen_w, screen_h = get_screen_resolution()
+
         # Register
         msg = {
             "type": "REGISTER",
@@ -109,6 +113,8 @@ class ControlClient:
             "hostname": self._hostname,
             "platform": self._platform,
             "udp_port": self._udp_port,
+            "screen_width": screen_w,
+            "screen_height": screen_h,
         }
         self._writer.write(json.dumps(msg).encode() + b"\n")
         await self._writer.drain()

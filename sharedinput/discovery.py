@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -132,16 +133,23 @@ class DiscoveryBroadcaster:
 class DiscoveryListener:
     """Listens for server announcements on the LAN.
 
-    Used by the tray app (when idle) to discover available servers
-    for the "Start as Client" submenu.
+    Used by the tray app (when idle) to discover available servers.
+    When ``on_server_found`` is set, it fires once when the first
+    server is discovered — used for auto-connect.
     """
 
-    def __init__(self, discovery_port: int = DEFAULT_DISCOVERY_PORT) -> None:
+    def __init__(
+        self,
+        discovery_port: int = DEFAULT_DISCOVERY_PORT,
+        on_server_found: Callable[[ServerInfo], None] | None = None,
+    ) -> None:
         self._discovery_port = discovery_port
         self._servers: dict[str, ServerInfo] = {}
         self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
+        self._on_server_found = on_server_found
+        self._callback_fired = False
 
     @property
     def servers(self) -> dict[str, ServerInfo]:
@@ -162,6 +170,7 @@ class DiscoveryListener:
         if self._running:
             return
         self._running = True
+        self._callback_fired = False
         self._thread = threading.Thread(target=self._listen_loop, daemon=True)
         self._thread.start()
         logger.info("Discovery listener started on port %d", self._discovery_port)
@@ -212,11 +221,19 @@ class DiscoveryListener:
         ip = msg.get("ip", addr[0])
         tcp_port = msg.get("tcp_port", 9877)
 
+        info = ServerInfo(
+            server_id=server_id,
+            hostname=hostname,
+            ip=ip,
+            tcp_port=tcp_port,
+            last_seen=time.monotonic(),
+        )
+
         with self._lock:
-            self._servers[server_id] = ServerInfo(
-                server_id=server_id,
-                hostname=hostname,
-                ip=ip,
-                tcp_port=tcp_port,
-                last_seen=time.monotonic(),
-            )
+            is_new = server_id not in self._servers
+            self._servers[server_id] = info
+
+        # Fire auto-connect callback on first server discovery
+        if is_new and self._on_server_found and not self._callback_fired:
+            self._callback_fired = True
+            self._on_server_found(info)

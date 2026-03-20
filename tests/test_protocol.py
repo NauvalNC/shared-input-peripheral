@@ -85,11 +85,12 @@ class TestKeyPressEvent:
         assert result.timestamp == 1000
 
     def test_empty_char(self):
-        """Modifier keys have no character."""
-        event = KeyPressEvent(keycode=162, char="", timestamp=2000)
+        """Modifier keys use key_name instead of char."""
+        event = KeyPressEvent(keycode=162, char="", key_name="ctrl_l", timestamp=2000)
         result = deserialize(serialize(event))
         assert result.keycode == 162
         assert result.char == ""
+        assert result.key_name == "ctrl_l"
 
     def test_unicode_char(self):
         event = KeyPressEvent(keycode=0, char="\u00e9", timestamp=3000)
@@ -137,4 +138,4 @@ class TestSerializeSize:
 
     def test_key_press_size(self):
         data = serialize(KeyPressEvent(keycode=65, char="a", timestamp=1))
-        assert len(data) == 18  # 10 header + 8 payload
+        assert len(data) == 46  # 10 header + 36 payload (4B keycode + 32B key_name)

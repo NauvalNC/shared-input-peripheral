@@ -85,10 +85,47 @@ class InputInjector:
     def _resolve_key(self, event: KeyPressEvent | KeyReleaseEvent) -> Key | KeyCode | None:
         """Resolve an event to a pynput key object.
 
-        Prefers character for printable keys, falls back to virtual keycode.
+        Uses key_name for platform-independent resolution:
+        - Single char → KeyCode.from_char() (printable keys)
+        - Multi-char name → Key enum lookup (e.g. "ctrl_l" → Key.ctrl_l)
         """
-        if event.char:
-            return KeyCode.from_char(event.char)
+        name = event.key_name
+
+        # Printable character (single char)
+        if len(name) == 1:
+            return KeyCode.from_char(name)
+
+        # Platform-independent key name → pynput Key enum
+        if name:
+            # Map common cross-platform names
+            name_map = {
+                "cmd": "cmd_l", "cmd_r": "cmd_r",
+                "shift": "shift_l",  # macOS sends "shift" for left shift
+                "enter": "enter",
+                "escape": "esc",
+                "backspace": "backspace",
+                "delete": "delete",
+                "caps_lock": "caps_lock",
+                "fn": "f1",  # fn key has no pynput equivalent; ignore
+                "num_lock": "num_lock",
+                "insert": "insert",
+            }
+            resolved_name = name_map.get(name, name)
+
+            try:
+                return Key[resolved_name]
+            except KeyError:
+                pass
+
+            # Try without _l/_r suffix
+            base = resolved_name.rstrip("_lr")
+            if base != resolved_name:
+                try:
+                    return Key[base]
+                except KeyError:
+                    pass
+
+        # Last resort: raw keycode (may not match across platforms)
         if event.keycode:
             return KeyCode.from_vk(event.keycode)
         return None

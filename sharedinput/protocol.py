@@ -4,7 +4,8 @@ Binary format (little-endian):
     type (1B) | flags (1B) | timestamp (8B) | payload (variable)
 
 All multi-byte fields are little-endian.  Mouse deltas are signed int16.
-Key events carry both a platform keycode and a UTF-8 character (up to 4 bytes).
+Key events carry a platform-independent key name (e.g. "ctrl_l", "a", "f1")
+in a 32-byte UTF-8 field, plus a raw keycode for backwards compat.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 _MOUSE_MOVE_FMT = "<hh"       # dx, dy (signed int16)
 _MOUSE_CLICK_FMT = "<BB"      # button, pressed
 _MOUSE_SCROLL_FMT = "<hh"     # dx, dy (signed int16)
-_KEY_FMT = "<I4s"             # keycode (uint32), char (4 bytes UTF-8 padded)
+_KEY_FMT = "<I32s"            # keycode (uint32), key_name (32 bytes UTF-8 padded)
 
 
 @dataclass(slots=True)
@@ -77,7 +78,8 @@ class MouseScrollEvent:
 @dataclass(slots=True)
 class KeyPressEvent:
     keycode: int
-    char: str
+    char: str           # printable character (1 char) or ""
+    key_name: str = ""  # platform-independent name: "ctrl_l", "f1", "tab", etc.
     timestamp: int = 0
 
     @property
@@ -88,7 +90,8 @@ class KeyPressEvent:
 @dataclass(slots=True)
 class KeyReleaseEvent:
     keycode: int
-    char: str
+    char: str           # printable character (1 char) or ""
+    key_name: str = ""  # platform-independent name: "ctrl_l", "f1", "tab", etc.
     timestamp: int = 0
 
     @property
@@ -99,14 +102,18 @@ class KeyReleaseEvent:
 InputEvent = Union[MouseMoveEvent, MouseClickEvent, MouseScrollEvent, KeyPressEvent, KeyReleaseEvent]
 
 
-def _encode_char(char: str) -> bytes:
-    """Encode a character as exactly 4 bytes (UTF-8, zero-padded)."""
-    encoded = char.encode("utf-8")[:4] if char else b""
-    return encoded.ljust(4, b"\x00")
+def _encode_key_name(key_name: str) -> bytes:
+    """Encode a key name as exactly 32 bytes (UTF-8, zero-padded).
+
+    The field holds either a printable character or a key name like
+    "ctrl_l", "shift_r", "f1", "tab", "enter", etc.
+    """
+    encoded = key_name.encode("utf-8")[:32] if key_name else b""
+    return encoded.ljust(32, b"\x00")
 
 
-def _decode_char(data: bytes) -> str:
-    """Decode a 4-byte zero-padded UTF-8 character."""
+def _decode_key_name(data: bytes) -> str:
+    """Decode a 32-byte zero-padded UTF-8 key name."""
     return data.rstrip(b"\x00").decode("utf-8", errors="replace")
 
 
@@ -133,11 +140,14 @@ def serialize(event: InputEvent) -> bytes:
         header = struct.pack(_HEADER_FMT, EventType.MOUSE_SCROLL, flags, ts)
 
     elif isinstance(event, KeyPressEvent):
-        payload = struct.pack(_KEY_FMT, event.keycode, _encode_char(event.char))
+        # Serialize key_name if set, otherwise fall back to char
+        name = event.key_name or event.char
+        payload = struct.pack(_KEY_FMT, event.keycode, _encode_key_name(name))
         header = struct.pack(_HEADER_FMT, EventType.KEY_PRESS, flags, ts)
 
     elif isinstance(event, KeyReleaseEvent):
-        payload = struct.pack(_KEY_FMT, event.keycode, _encode_char(event.char))
+        name = event.key_name or event.char
+        payload = struct.pack(_KEY_FMT, event.keycode, _encode_key_name(name))
         header = struct.pack(_HEADER_FMT, EventType.KEY_RELEASE, flags, ts)
 
     else:
@@ -167,12 +177,16 @@ def deserialize(data: bytes) -> InputEvent:
         return MouseScrollEvent(dx=dx, dy=dy, timestamp=timestamp)
 
     elif event_type == EventType.KEY_PRESS:
-        keycode, char_bytes = struct.unpack(_KEY_FMT, payload)
-        return KeyPressEvent(keycode=keycode, char=_decode_char(char_bytes), timestamp=timestamp)
+        keycode, name_bytes = struct.unpack(_KEY_FMT, payload)
+        name = _decode_key_name(name_bytes)
+        char = name if len(name) == 1 else ""
+        return KeyPressEvent(keycode=keycode, char=char, key_name=name, timestamp=timestamp)
 
     elif event_type == EventType.KEY_RELEASE:
-        keycode, char_bytes = struct.unpack(_KEY_FMT, payload)
-        return KeyReleaseEvent(keycode=keycode, char=_decode_char(char_bytes), timestamp=timestamp)
+        keycode, name_bytes = struct.unpack(_KEY_FMT, payload)
+        name = _decode_key_name(name_bytes)
+        char = name if len(name) == 1 else ""
+        return KeyReleaseEvent(keycode=keycode, char=char, key_name=name, timestamp=timestamp)
 
     else:
         raise ValueError(f"Unknown event type: {event_type:#x}")

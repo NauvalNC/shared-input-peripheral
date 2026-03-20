@@ -84,15 +84,22 @@ def _pynput_button_to_mouse_button(button) -> MouseButton:
     return mapping.get(button, MouseButton.LEFT)
 
 
-def _key_to_keycode_and_char(key) -> tuple[int, str]:
+def _key_to_event_fields(key) -> tuple[int, str, str]:
+    """Convert a pynput key to (keycode, char, key_name).
+
+    Returns platform-independent key_name for all keys:
+    - Special keys (Key.ctrl_l, Key.f1): key_name = "ctrl_l", "f1"
+    - Printable keys (KeyCode): key_name = the character itself
+    """
     from pynput import keyboard
     if isinstance(key, keyboard.Key):
-        return (key.value.vk if key.value and hasattr(key.value, "vk") else hash(key) & 0xFFFFFFFF, "")
+        vk = key.value.vk if key.value and hasattr(key.value, "vk") else 0
+        return (vk, "", key.name)  # key.name is consistent across platforms
     elif isinstance(key, keyboard.KeyCode):
         vk = key.vk if key.vk is not None else 0
         char = key.char if key.char else ""
-        return (vk, char)
-    return (0, "")
+        return (vk, char, char)  # for printable keys, key_name = char
+    return (0, "", "")
 
 
 class InputCapture:
@@ -170,14 +177,18 @@ class InputCapture:
     def _on_key_press(self, key) -> None:
         if not self._running or key is None:
             return
-        keycode, char = _key_to_keycode_and_char(key)
-        self._callback(KeyPressEvent(keycode=keycode, char=char, timestamp=monotonic_ns()))
+        keycode, char, key_name = _key_to_event_fields(key)
+        self._callback(KeyPressEvent(
+            keycode=keycode, char=char, key_name=key_name, timestamp=monotonic_ns(),
+        ))
 
     def _on_key_release(self, key) -> None:
         if not self._running or key is None:
             return
-        keycode, char = _key_to_keycode_and_char(key)
-        self._callback(KeyReleaseEvent(keycode=keycode, char=char, timestamp=monotonic_ns()))
+        keycode, char, key_name = _key_to_event_fields(key)
+        self._callback(KeyReleaseEvent(
+            keycode=keycode, char=char, key_name=key_name, timestamp=monotonic_ns(),
+        ))
 
 
 class QueuedCapture:

@@ -103,6 +103,64 @@ def ensure_accessibility(exit_on_fail: bool = True) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# macOS CGEvent keycode → platform-independent key name mapping
+# ---------------------------------------------------------------------------
+
+# Maps macOS CGEvent keycodes to pynput-compatible key names.
+# Printable keys are handled via CGEventKeyboardGetUnicodeString instead.
+_CG_KEYCODE_TO_NAME: dict[int, str] = {
+    # Modifiers
+    56: "shift", 60: "shift_r",
+    59: "ctrl_l", 62: "ctrl_r",
+    58: "alt_l", 61: "alt_r",
+    55: "cmd", 54: "cmd_r",
+    57: "caps_lock",
+    63: "fn",
+    # Navigation
+    36: "enter", 76: "enter",  # Return + numpad Enter
+    48: "tab",
+    49: "space",
+    51: "backspace",
+    117: "delete",
+    53: "escape",
+    # Arrow keys
+    123: "left", 124: "right", 125: "down", 126: "up",
+    # Home/End/Page
+    115: "home", 119: "end",
+    116: "page_up", 121: "page_down",
+    # Function keys
+    122: "f1", 120: "f2", 99: "f3", 118: "f4",
+    96: "f5", 97: "f6", 98: "f7", 100: "f8",
+    101: "f9", 109: "f10", 103: "f11", 111: "f12",
+    105: "f13", 107: "f14", 113: "f15", 106: "f16",
+    64: "f17", 79: "f18", 80: "f19", 90: "f20",
+    # Media keys
+    114: "insert",
+    # Numpad
+    82: "num_0", 83: "num_1", 84: "num_2", 85: "num_3",
+    86: "num_4", 87: "num_5", 88: "num_6", 89: "num_7",
+    91: "num_8", 92: "num_9",
+    65: "num_decimal", 67: "num_multiply", 69: "num_add",
+    75: "num_divide", 78: "num_subtract", 81: "num_equal",
+    71: "num_lock",
+}
+
+
+def _cg_keycode_to_key_name(keycode: int, char: str) -> str:
+    """Convert a CGEvent keycode + character to a platform-independent key name.
+
+    Returns the character for printable keys, or a name like "ctrl_l" for
+    special/modifier keys.
+    """
+    # Check special key map first
+    name = _CG_KEYCODE_TO_NAME.get(keycode)
+    if name:
+        return name
+    # Fall back to the printable character
+    return char
+
+
+# ---------------------------------------------------------------------------
 # CGEventTap-based input capture (must run on main thread)
 # ---------------------------------------------------------------------------
 
@@ -309,11 +367,13 @@ if _HAS_QUARTZ:
                 chars = Quartz.CGEventKeyboardGetUnicodeString(
                     cg_event, 4, None, None
                 )
-                # CGEventKeyboardGetUnicodeString returns (length, chars_out)
                 char = ""
                 if isinstance(chars, tuple) and len(chars) >= 2 and chars[0] > 0:
                     char = chars[1][:1] if chars[1] else ""
-                return KeyPressEvent(keycode=keycode, char=char, timestamp=ts)
+                name = _cg_keycode_to_key_name(keycode, char)
+                return KeyPressEvent(
+                    keycode=keycode, char=char, key_name=name, timestamp=ts,
+                )
 
             # Key up
             if event_type == Quartz.kCGEventKeyUp:
@@ -326,7 +386,10 @@ if _HAS_QUARTZ:
                 char = ""
                 if isinstance(chars, tuple) and len(chars) >= 2 and chars[0] > 0:
                     char = chars[1][:1] if chars[1] else ""
-                return KeyReleaseEvent(keycode=keycode, char=char, timestamp=ts)
+                name = _cg_keycode_to_key_name(keycode, char)
+                return KeyReleaseEvent(
+                    keycode=keycode, char=char, key_name=name, timestamp=ts,
+                )
 
             # Modifier key (Ctrl, Alt, Shift, Cmd) press/release
             if event_type == Quartz.kCGEventFlagsChanged:
@@ -334,12 +397,16 @@ if _HAS_QUARTZ:
                     cg_event, Quartz.kCGKeyboardEventKeycode
                 )
                 flags = Quartz.CGEventGetFlags(cg_event)
-                # Determine press vs release from the modifier flags
                 pressed = self._is_modifier_pressed(keycode, flags)
+                name = _cg_keycode_to_key_name(keycode, "")
                 if pressed:
-                    return KeyPressEvent(keycode=keycode, char="", timestamp=ts)
+                    return KeyPressEvent(
+                        keycode=keycode, char="", key_name=name, timestamp=ts,
+                    )
                 else:
-                    return KeyReleaseEvent(keycode=keycode, char="", timestamp=ts)
+                    return KeyReleaseEvent(
+                        keycode=keycode, char="", key_name=name, timestamp=ts,
+                    )
 
             return None
 

@@ -11,6 +11,8 @@ import threading
 
 from sharedinput.config import Config
 from sharedinput.discovery import DiscoveryBroadcaster
+from sharedinput.platform import get_screen_resolution
+from sharedinput.protocol import MouseMoveEvent
 from sharedinput.server.capture import InputCapture, install_macos_tap, stop_macos_tap, use_macos_backend
 from sharedinput.server.network import ControlServer, UDPSender
 from sharedinput.server.switcher import HotkeySwitcher
@@ -34,6 +36,7 @@ class Server:
         self._forwarding = False
         self._shutdown_flag = threading.Event()  # thread-safe for shutdown()
         self._macos_tap_installed = False
+        self._server_screen_w, self._server_screen_h = get_screen_resolution()
 
     def _on_event(self, event) -> None:
         """Callback from input capture — forward event and detect hotkeys."""
@@ -47,9 +50,36 @@ class Server:
                 self._switcher.feed_key_release(event.keycode)
 
             if self._forwarding:
+                # Scale mouse deltas to match client screen resolution
+                if isinstance(event, MouseMoveEvent):
+                    event = self._scale_mouse_event(event)
                 self._udp_sender.send(event)
         except Exception:
             logger.warning("Error processing input event", exc_info=True)
+
+    def _scale_mouse_event(self, event: MouseMoveEvent) -> MouseMoveEvent:
+        """Scale mouse deltas from server resolution to active client resolution."""
+        active_id = self._switcher.active_client_id
+        if not active_id:
+            return event
+
+        clients = self._control_server.clients
+        client = clients.get(active_id)
+        if not client:
+            return event
+
+        # Scale based on width ratio (most common axis for mouse sensitivity)
+        if self._server_screen_w and client.screen_width:
+            scale_x = client.screen_width / self._server_screen_w
+            scale_y = client.screen_height / self._server_screen_h
+            dx = int(event.dx * scale_x)
+            dy = int(event.dy * scale_y)
+            return MouseMoveEvent(
+                dx=max(-32768, min(32767, dx)),
+                dy=max(-32768, min(32767, dy)),
+                timestamp=event.timestamp,
+            )
+        return event
 
     def _on_switch(self, client_id: str | None) -> None:
         """Callback from switcher — update forwarding target."""
